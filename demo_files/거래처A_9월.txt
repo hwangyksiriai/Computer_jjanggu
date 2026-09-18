@@ -1,0 +1,7 @@
+INVOICE
+Invoice No: 2026-0918
+Bill to: Studio Pocket
+Subtotal: USD 1,200
+Amount due: USD 1,320
+Payment due: 2026-10-01
+Design service for September.

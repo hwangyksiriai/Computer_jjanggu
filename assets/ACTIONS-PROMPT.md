@@ -1,0 +1,7 @@
+# Action frames
+
+Tool: built-in ImageGen. Reference: shinchan-sheet.png. Output: shinchan-actions.png.
+
+Final prompt:
+
+Create a clean transparent animation sprite atlas using the canonical Shin-chan character appearance in the supplied image as character reference. EXACTLY 4 rows by 4 columns, equal square cells, all 16 cells show ONE full-body Shin-chan with consistent scale, red shirt and yellow shorts and recognizable thick eyebrows. Entire background truly transparent. Leave margins between all cells, no borders, no labels, no words, no shadows. Row 1 is a four-frame animation of receiving a small pale blue file folder: 1 arms reaching forward, 2 bending knees to take folder, 3 standing holding folder at chest, 4 proudly lifting folder. Row 2 is a four-frame walking cycle pulling a tiny red wagon with pale blue folders: alternating legs and arm movement across four frames, side-facing right. Row 3 is four-frame playful hula/hip-wiggle dance in red shirt yellow shorts: hips left arms up, hips middle bent knees, hips right arms up, hips middle straight knees. Cute silly fully clothed cartoon dance. Row 4 is a four-frame animation of returning a folder: 1 folder held close, 2 leaning forward, 3 arms stretched offering folder, 4 empty hands waving. Simple clean 2D cel animation, bold dark outlines, flat colors. Same foot baseline within every cell. Each figure and props stay inside the central 80 percent of its cell. No extra characters. Usable production sprite sheet.
