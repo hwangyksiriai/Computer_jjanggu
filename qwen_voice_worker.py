@@ -11,7 +11,7 @@ def synthesize(request):
     global model
     import torch
     import soundfile as sf
-    from qwen_tts import Qwen3TTSModel
+    from qwen_tts import Qwen3TTSModel,VoiceClonePromptItem
     torch.set_num_threads(4)
     reference=Path(request['reference']).resolve()
     if not reference.is_file():raise ValueError('참고 음성 파일이 없습니다.')
@@ -26,10 +26,24 @@ def synthesize(request):
         model=Qwen3TTSModel.from_pretrained(str(runtime/'qwen3-tts-base'),device_map='cpu',dtype=torch.float32,attn_implementation='sdpa',local_files_only=True)
         print('VOICE_ENGINE_READY',file=sys.stderr,flush=True)
     if signature not in prompts:
-        prompts[signature]=model.create_voice_clone_prompt(ref_audio=str(reference),x_vector_only_mode=True)
+        # In x-vector-only mode ref_code is discarded. Avoid the expensive
+        # speech-tokenizer encode that the generic helper performs regardless.
+        speaker_cache=cache/('speaker-'+signature+'.json')
+        if speaker_cache.exists():
+            embedding=torch.tensor(json.loads(speaker_cache.read_text('utf-8')),dtype=torch.float32)
+        else:
+            audio,rate=sf.read(reference,dtype='float32')
+            if audio.ndim>1:audio=audio.mean(axis=1)
+            wanted=model.model.speaker_encoder_sample_rate
+            if rate!=wanted:
+                import librosa
+                audio=librosa.resample(audio,orig_sr=rate,target_sr=wanted)
+            embedding=model.model.extract_speaker_embedding(audio=audio,sr=wanted)
+            speaker_cache.write_text(json.dumps(embedding.detach().cpu().tolist()),encoding='utf-8')
+        prompts[signature]=[VoiceClonePromptItem(ref_code=None,ref_spk_embedding=embedding,x_vector_only_mode=True,icl_mode=False,ref_text=None)]
     print('VOICE_GENERATING',file=sys.stderr,flush=True)
     torch.manual_seed(1234)
-    wavs,rate=model.generate_voice_clone(text=text,language='Korean',voice_clone_prompt=prompts[signature],non_streaming_mode=True,max_new_tokens=180)
+    wavs,rate=model.generate_voice_clone(text=text,language='Korean',voice_clone_prompt=prompts[signature],non_streaming_mode=True,max_new_tokens=max(180,min(1200,len(text)*6)))
     if not len(wavs[0]):raise ValueError('생성된 음성이 비어 있습니다.')
     temp=output.with_suffix('.tmp.wav');sf.write(temp,wavs[0],rate);temp.replace(output)
     return str(output)

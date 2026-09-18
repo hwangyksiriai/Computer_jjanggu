@@ -1,5 +1,5 @@
 """Non-UI client for the isolated, offline speech engine."""
-import json,queue,subprocess,threading
+import hashlib,json,queue,re,subprocess,threading
 from pathlib import Path
 
 BASE=Path(__file__).resolve().parent
@@ -17,6 +17,10 @@ class QwenVoiceClient:
 
     def generate(self,text,reference):
         with self.lock:
+            signature=hashlib.sha256(Path(reference).read_bytes()).hexdigest()
+            identity=json.dumps([signature,text,'qwen-0.6b-fp32-v2'],ensure_ascii=False)
+            cached=BASE/'.local/voice-generated'/(hashlib.sha256(identity.encode()).hexdigest()+'.wav')
+            if cached.is_file():return str(cached)
             if self.idle_timer:self.idle_timer.cancel()
             runtime=Path(json.loads((BASE/'.local/runtime.json').read_text('utf-8-sig'))['runtime_root'])
             if not self.process or self.process.poll() is not None:
@@ -32,7 +36,7 @@ class QwenVoiceClient:
                 threading.Thread(target=read,daemon=True).start()
             try:
                 self.process.stdin.write(json.dumps({'text':text,'reference':reference},ensure_ascii=False)+'\n');self.process.stdin.flush()
-                response=self.responses.get(timeout=300)
+                response=self.responses.get(timeout=600)
                 if not response.get('ok'):raise RuntimeError(response.get('error','음성 생성 실패'))
                 path=Path(response['path']).resolve()
                 if not path.is_relative_to((BASE/'.local/voice-generated').resolve()) or not path.is_file():raise RuntimeError('음성 파일 경로가 올바르지 않아요.')
@@ -40,4 +44,18 @@ class QwenVoiceClient:
             except (queue.Empty,BrokenPipeError):
                 self.close();raise RuntimeError('음성 생성 시간이 초과됐어요.')
             finally:
-                self.idle_timer=threading.Timer(120,self.close);self.idle_timer.daemon=True;self.idle_timer.start()
+                self.idle_timer=threading.Timer(900,self.close);self.idle_timer.daemon=True;self.idle_timer.start()
+
+def speech_chunks(text,limit=90):
+    chunks=[];pending=''
+    for part in re.split(r'(?<=[.!?。！？])\s*|\n+',text.strip()):
+        if not part:continue
+        while len(part)>limit:
+            if pending:chunks.append(pending);pending=''
+            split=part.rfind(' ',0,limit+1)
+            if split<limit//2:split=limit
+            chunks.append(part[:split]);part=part[split:].strip()
+        if len(pending)+len(part)+1>limit:chunks.append(pending);pending=''
+        pending=(pending+' '+part).strip()
+    if pending:chunks.append(pending)
+    return chunks

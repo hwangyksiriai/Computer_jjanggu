@@ -29,6 +29,7 @@ class PetBubble:
         self.resize(self.HEIGHT)
         head=tk.Frame(body,bg=WHITE); head.pack(fill='x')
         greeting=random.choice(['뭘 찾아줄까?','오늘은 무슨 일을 도와줄까?','뭐 찾고 있어? 내가 도와줄게!'])
+        if app.settings.get('voice_mode')=='qwen_local':greeting='오늘은 어떤 일을 도와줄까?'
         label(head,greeting,12,INK,bold=True,bg=WHITE).pack(side='left')
         button(head,'×',self.close,bg=WHITE).pack(side='right')
         self.text=tk.StringVar(); entryrow=tk.Frame(body,bg=WHITE,highlightbackground='#303030',highlightthickness=1); entryrow.pack(fill='x',pady=(10,6))

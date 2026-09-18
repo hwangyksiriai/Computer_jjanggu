@@ -44,9 +44,31 @@ class Voice:
         self.process = None
         self.lock = threading.Lock()
         self.error_callback = error_callback
+        self.speech_token=object(); self.qwen_client=None
 
     def say(self, text, settings, force=False):
         if not settings['sound'] and not force:
+            return
+        if settings.get('voice_mode')=='qwen_local':
+            from qwen_voice import QwenVoiceClient,speech_chunks
+            self.stop(); token=self.speech_token
+            if self.qwen_client is None:self.qwen_client=QwenVoiceClient()
+            reference=settings.get('voice_reference','')
+            captured=dict(settings)
+            def generate_and_play():
+                try:
+                    for part in speech_chunks(text):
+                        if self.speech_token is not token:return
+                        self.error_callback('짱구 답변 음성 준비 중 · 처음 생성하는 문장은 시간이 걸릴 수 있어요.')
+                        path=self.qwen_client.generate(part,reference)
+                        if self.speech_token is not token:return
+                        self.error_callback('짱구 답변 음성을 재생합니다.')
+                        self.play_clip(path,captured,force,preserve_request=True)
+                        process=self.process
+                        if process:process.wait()
+                except Exception as e:
+                    if self.speech_token is token:self.error_callback('짱구 음성 생성 실패: '+str(e))
+            threading.Thread(target=generate_and_play,daemon=True).start()
             return
         from voice_clips import event_for
         clip=settings.get('voice_clips',{}).get(event_for(text))
@@ -75,10 +97,10 @@ class Voice:
         except OSError:
             self.error_callback('Windows 음성 엔진을 실행하지 못했어요.')
 
-    def play_clip(self,path,settings,force=False):
+    def play_clip(self,path,settings,force=False,preserve_request=False):
         if not settings['sound'] and not force: return
         import sys
-        self.stop()
+        self.stop(cancel_speech=not preserve_request)
         payload=json.dumps({'path':str(path),'volume':settings.get('volume',70)},ensure_ascii=False).encode('utf-8')
         try:
             with self.lock:
@@ -90,11 +112,18 @@ class Voice:
             threading.Thread(target=wait,daemon=True).start()
         except OSError: self.error_callback('음성 재생기를 열지 못했어요.')
 
-    def stop(self):
+    def stop(self,cancel_speech=True):
+        if cancel_speech:self.speech_token=object()
         with self.lock:
             if self.process and self.process.poll() is None:
                 self.process.terminate()
             self.process = None
+
+    def close(self):
+        self.stop()
+        if self.qwen_client:
+            process=self.qwen_client.process
+            if process and process.poll() is None:process.terminate()
 
 class Sprites:
     def __init__(self):
@@ -687,7 +716,7 @@ class App:
             messagebox.showinfo('잠깐만!','파일 작업이 진행 중이에요. 끝난 뒤 종료해 주세요.'); return
         if self.icon_changed or self.settings.get('icons_hidden_by_app'): set_desktop_icons(True)
         self.settings['icons_hidden_by_app']=False; self.save()
-        self.voice.stop(); self.pool.shutdown(wait=False,cancel_futures=True); self.root.destroy()
+        self.voice.close(); self.pool.shutdown(wait=False,cancel_futures=True); self.root.destroy()
 
 def main():
     parser=argparse.ArgumentParser(); parser.add_argument('--data-dir'); parser.add_argument('--background',action='store_true'); args=parser.parse_args()

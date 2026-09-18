@@ -1,13 +1,13 @@
 # 집과 회사에서 Git으로 이어 작업하기
 
-Git은 코드의 변경을 기록하고 주고받는 도구입니다. 두 컴퓨터 사이에 공유할 원격 저장소가 필요합니다. 이 프로젝트는 비공개 저장소 사용을 전제로 준비합니다.
+Git은 코드의 변경을 기록하고 주고받는 도구입니다. 사용자가 지정한 저장소는 https://github.com/hwangyksiriai/Computer_jjanggu 이며 현재 공개 저장소입니다. 실제 업무 문서·개인 검색 DB·등록 음성은 Git 대상에서 제외됩니다.
 
 ## 처음 한 번: 집 PC
 
 원격 저장소 주소를 연결하고 첫 커밋을 올립니다. 원격 저장소 생성·로그인이 완료되기 전에는 회사 PC에서 clone할 수 없습니다.
 
 ```powershell
-git remote add origin <비공개 저장소 주소>
+git remote add origin https://github.com/hwangyksiriai/Computer_jjanggu.git
 git push -u origin master
 ```
 
@@ -21,7 +21,7 @@ GitHub 연결 전에 USB로 가져갈 경우 `배포/작은주머니-개발이�
 2. 작업할 폴더에서 아래 명령을 실행합니다.
 
 ```powershell
-git clone <비공개 저장소 주소> shinchan-pocket
+git clone https://github.com/hwangyksiriai/Computer_jjanggu.git shinchan-pocket
 cd shinchan-pocket
 ```
 

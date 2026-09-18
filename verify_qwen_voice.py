@@ -6,7 +6,7 @@ from local_ai import LocalAI
 base=Path(__file__).parent
 runtime=Path(json.loads((base/'.local/runtime.json').read_text('utf-8-sig'))['runtime_root'])
 reference=base/'.local/voice-reference/comparison/reference-0.wav'
-phrases=['알았어. 인보이스 찾아볼게.','급여명세서 세 개를 찾았어.','오늘은 어떤 일을 도와줄까?']
+phrases=['알았어. 파일을 찾아볼게.','파일 세 개를 찾았어.','오늘은 어떤 일을 도와줄까?']
 report=[]
 log=(base/'.local/qwen-voice-test.log').open('w',encoding='utf-8')
 proc=subprocess.Popen([str(runtime/'voice-env/Scripts/python.exe'),'-X','utf8',str(base/'qwen_voice_worker.py')],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=log,text=True,encoding='utf-8',creationflags=0x08000000)

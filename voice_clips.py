@@ -11,7 +11,7 @@ def event_for(text):
     if '정리 끝' in text: return 'clean'
     if '훌라' in text or '같이 춤' in text: return 'dance'
     if '개 찾았어' in text: return 'found'
-    if '돋보기 들고 찾아볼게' in text: return 'search'
+    if '돋보기 들고 찾아볼게' in text or '파일을 찾아볼게' in text: return 'search'
     if '다른 단서로도 찾아볼까' in text: return 'empty'
     return None
 

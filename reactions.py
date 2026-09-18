@@ -12,7 +12,7 @@ def quick_intent(text):
     return None
 
 REACTIONS={
- 'SEARCH':('search','알았어! 돋보기 들고 찾아볼게!'),
+ 'SEARCH':('search','알았어. 파일을 찾아볼게.'),
  'CLEAN':('clean','좋아! 정리할 파일부터 챙겨볼게!'),
  'CHAT':('think','응, 들었어! 잠깐 생각해 볼게!'),
  'CLOSET':('dress','좋아! 어떤 옷이 어울릴까?'),
