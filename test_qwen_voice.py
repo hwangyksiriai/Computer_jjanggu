@@ -14,12 +14,13 @@ class VoiceRoutingTests(unittest.TestCase):
         finished=threading.Event();seen=[]
         class Engine:
             def generate(self,text,reference):seen.append((text,reference));return 'generated.wav'
-        voice=Voice(lambda e:self.fail(e));voice.qwen_client=Engine()
+        messages=[];voice=Voice(messages.append);voice.qwen_client=Engine()
         with patch.object(voice,'play_clip',side_effect=lambda *a,**kw:finished.set()) as play,patch('app.subprocess.Popen') as system_tts:
             voice.say('파일 세 개를 찾았어.',{'sound':True,'voice_mode':'qwen_local','voice_reference':'reference.wav','voice_clips':{'greeting':'unrelated.wav'}})
             self.assertTrue(finished.wait(3))
             self.assertEqual(seen,[('파일 세 개를 찾았어.','reference.wav')])
             self.assertEqual(play.call_args.args[0],'generated.wav');system_tts.assert_not_called()
+            self.assertFalse(any('실패' in m for m in messages),messages)
 
     def test_cancel_discards_late_audio(self):
         started=threading.Event();release=threading.Event();done=threading.Event()

@@ -1,5 +1,13 @@
 # 첨부 영상 기반 로컬 음성 시험
 
+## Qwen 엔진 추가 검증
+
+- 공식 Qwen3-TTS-12Hz-0.6B-Base의 고정 revision `5d83992436eae1d760afd27aff78a71d676296fc`를 D:에 설치. 입력 파일을 외부에 업로드하지 않고 HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE로 추론.
+- CPU BF16 시험은 지연으로 중단. FP32/SDPA로 한국어 문장 생성과 WAV 재생 확인. 첫 준비/생성 150~200초, 준비 후 짧은 문장 약 14~16초, 같은 문장은 파일 캐시 재생.
+- 새 시험: “알았어. 파일을 찾아볼게.”와 “오늘은 어떤 일을 도와줄까?”는 로컬 Whisper 인식이 입력과 일치. “파일 세 개를 찾았어.”는 반복 인식 오류로 문장 정확성 검증 실패. 이전 인보이스/급여명세서 문장도 핵심 명사의 정확성 미확인.
+- 따라서 자유 발화 전체의 품질은 **미완료**. `qwen_local` 비동기 연결 코드는 구현했지만 사용자 기본 설정에는 활성화하지 않았다. 음색이 원작 짱구와 동일하다고 검증하지 않았다.
+- x-vector-only 모드에서 버려지는 참조 음성 코드 encode는 생략하고 목소리 특징을 캐시하도록 수정. 엔진/검증: qwen_voice_worker.py, qwen_voice.py, verify_qwen_voice.py. 개인 출력과 참조 음성은 .local에 저장되며 Git에 포함하지 않는다.
+
 2026-09-18. 사용자 제공 MP4(31.856초)에서 24kHz 모노 WAV를 로컬로 추출했습니다. 영상·음성은 외부로 업로드하지 않았습니다.
 
 - 분리 환경: D:\ShinchanPocketRuntime\desktop-pet\voice-env (Python 3.12, torch/torchaudio 2.8 CPU, coqui-tts 0.27.5, transformers 4.57.6).
