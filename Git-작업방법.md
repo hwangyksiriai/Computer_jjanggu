@@ -15,6 +15,8 @@ git push -u origin master
 
 ## 처음 한 번: 회사 PC
 
+GitHub 연결 전에 USB로 가져갈 경우 `배포/작은주머니-개발이력.bundle`을 회사 PC로 복사한 뒤 `git clone 작은주머니-개발이력.bundle shinchan-pocket`으로 소스와 커밋 이력을 복원할 수 있습니다. 이 파일은 생성 시점의 스냅샷이므로 이후 작업분은 다시 생성해야 합니다. 나중에 GitHub를 쓰면 origin을 해당 원격 주소로 변경합니다.
+
 1. Git과 Codex를 설치하고 저장소 계정에 로그인합니다.
 2. 작업할 폴더에서 아래 명령을 실행합니다.
 
