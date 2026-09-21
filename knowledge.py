@@ -9,7 +9,7 @@ import re
 import time
 from PIL import Image,ImageDraw,ImageFont
 import colorsys
-from core import Library,BASE,IMAGE_EXTS,KINDS,fingerprint,serialized,classify,payroll_evidence
+from core import Library,BASE,IMAGE_EXTS,KINDS,fingerprint,serialized,classify,payroll_evidence,payroll_title,EXTRACT_VERSION
 
 def cosine(a,b):
     if not a or not b: return 0.0
@@ -138,8 +138,9 @@ class Knowledge(Library):
             old=dict(old) if old else {}
             thumb=old.get('thumbnail',''); vectors=json.loads(old.get('vectors') or '[]'); visual=json.loads(old.get('visual') or '[]')
             fields=json.loads(old.get('fields') or '{}'); tags=json.loads(old.get('tags') or '[]')
-            if old.get('signature')!=signature:
+            if old.get('signature')!=signature or fields.get('_extract_version')!=EXTRACT_VERSION:
                 fields={**fields_from_text(row['body']),**json.loads(old.get('manual_fields') or '{}')}
+                fields['_extract_version']=EXTRACT_VERSION
                 vectors=[]; visual=[]; thumb=self.thumbnail(row)
             if thumb and 'visual_colors' not in fields: fields['visual_colors']=image_colors(thumb)
             category=old.get('manual_category','')
@@ -238,7 +239,7 @@ class Knowledge(Library):
                                                                  {'role':'user','content':q+' /no_think'}],max_tokens=55)
                     vvec=self.ai.call('visual_text',text=translated)
             except Exception as e: self.ai_error=str(e)
-        wanted_kind=next((k for k,words in KINDS.items() if any(t in q.lower() for t in [k]+words)),None)
+        wanted_kind='급여명세서' if payroll_title(q) else next((k for k,words in KINDS.items() if any(t in q.lower() for t in [k]+words)),None)
         currency=next((code for code,words in [('USD',['달러','usd']),('KRW',['원화','krw']),('EUR',['유로','eur']),('JPY',['엔화','jpy'])] if any(w in q.lower() for w in words)),None)
         now=datetime.now(); start=end=None
         if '지난달' in q:
@@ -263,7 +264,7 @@ class Knowledge(Library):
             inferred=classify(r['name'],r['body'])
             type_match=wanted_kind==(r['manual_category'] or inferred) if wanted_kind else False
             payroll=payroll_evidence(r['body']) if wanted_kind=='급여명세서' else []
-            payroll_candidate=len(payroll)>=2
+            payroll_candidate=len(payroll)>=2 and (len(payroll)>=3 or bool(re.search(r'\d[\d,]{2,}',r['body'])))
             # Embedding cosine is not a probability. Generic business documents
             # often score highly; require payroll evidence for this document type.
             if wanted_kind=='급여명세서' and not (type_match or payroll_candidate):
@@ -287,6 +288,8 @@ class Knowledge(Library):
             evidence=next((s.strip() for s in sentences if any(t.lower() in s.lower() for t in terms)),r['body'][:180])
             if payroll: evidence='급여 문서 단서: '+', '.join(payroll)+' · '+evidence
             r.update(score=score,reason=' · '.join(reasons),group='일치하는 파일' if direct or type_match else '관련 후보',evidence=evidence[:220])
+            if wanted_kind=='급여명세서' and not payroll_title(r['name']+' '+r['body']) and r['manual_category']!='급여명세서':
+                r['group']='관련 후보'
             results.append(r)
         return sorted(results,key=lambda r:(r['group']=='일치하는 파일',r['score']),reverse=True),q
 

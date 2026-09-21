@@ -93,7 +93,9 @@ def startup(enabled,script):
     import sys,winreg
     python=Path(sys.executable).with_name('pythonw.exe')
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Run') as key:
-        if enabled: winreg.SetValueEx(key,'ShinchanPocket',0,winreg.REG_SZ,f'"{python}" "{Path(script).resolve()}" --background')
+        if enabled:
+            command=f'"{sys.executable}" --background' if getattr(sys,'frozen',False) else f'"{python}" "{Path(script).resolve()}" --background'
+            winreg.SetValueEx(key,'ShinchanPocket',0,winreg.REG_SZ,command)
         else:
             try: winreg.DeleteValue(key,'ShinchanPocket')
             except FileNotFoundError: pass

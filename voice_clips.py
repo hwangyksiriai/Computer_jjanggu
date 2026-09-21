@@ -39,7 +39,9 @@ def scaled_wav(path,volume):
         w.setparams(params); w.writeframes(signal.astype('<i2').tobytes())
     return output.getvalue()
 
-if __name__=='__main__':
+def play_request():
     import sys,winsound
     request=json.loads(sys.stdin.buffer.read().decode('utf-8'))
     winsound.PlaySound(scaled_wav(request['path'],request['volume']),winsound.SND_MEMORY)
+
+if __name__=='__main__': play_request()

@@ -13,6 +13,7 @@ import subprocess
 import time
 import uuid
 import threading
+import unicodedata
 from functools import wraps
 import zipfile
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ from datetime import datetime, timedelta
 from xml.etree import ElementTree
 
 BASE = Path(__file__).resolve().parent
+EXTRACT_VERSION = 2
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'}
 TEXT_EXTS = {'.txt', '.md', '.csv', '.tsv', '.json', '.log'}
 SKIP_EXTS = {'.lnk', '.url', '.exe', '.msi', '.dll', '.sys', '.tmp', '.part', '.crdownload'}
@@ -85,21 +87,26 @@ def extract(path):
             reader = PdfReader(p)
             if reader.is_encrypted:
                 return '', '암호 문서 · 이름만 검색'
-            text = '\n'.join(page.extract_text() or '' for page in reader.pages[:60])[:100_000]
-            if text.strip(): return text, ('본문 분석 완료' if len(reader.pages)<=60 else '앞 60쪽 본문 분석 완료')
+            pages = [page.extract_text() or '' for page in reader.pages[:60]]
+            missing = [i for i,text in enumerate(pages[:12]) if len(re.sub(r'\s+','',text)) < 40]
+            if not missing:
+                return '\n'.join(pages)[:100_000], ('본문 분석 완료' if len(reader.pages)<=60 else '앞 60쪽 본문 분석 완료')
             import pymupdf
             cache=BASE/'.local'/'ocr-pages'; cache.mkdir(parents=True,exist_ok=True)
-            pieces=[]
+            recognized=0
             with pymupdf.open(p) as doc:
-                for number in range(min(12,doc.page_count)):
+                for number in missing:
                     image=cache/(uuid.uuid4().hex+'.png')
                     try:
                         doc[number].get_pixmap(matrix=pymupdf.Matrix(1.5,1.5),alpha=False).save(image)
                         page_text,_=extract(image)
-                        if page_text: pieces.append(f'[페이지 {number+1}]\n{page_text}')
+                        if page_text:
+                            pages[number]+='\n'+page_text; recognized+=1
                     finally:
                         if image.exists(): image.unlink()
-                return '\n'.join(pieces)[:100_000], ('스캔 PDF OCR 완료' if pieces and doc.page_count<=12 else ('앞 12쪽 OCR 완료' if pieces else '스캔 PDF · 인식된 글자 없음'))
+                text='\n'.join(pages)[:100_000]
+                return text, ('본문·이미지 글자 분석 완료' if recognized and len(reader.pages)<=12 else
+                              ('본문 분석·OCR 일부 범위' if text.strip() else '스캔 PDF · 인식된 글자 없음'))
         if ext in {'.pptx','.xlsx'}:
             with zipfile.ZipFile(p) as z:
                 names=[n for n in z.namelist() if (n.startswith('ppt/slides/slide') or n=='xl/sharedStrings.xml' or n.startswith('xl/worksheets/sheet')) and n.endswith('.xml')]
@@ -124,15 +131,20 @@ def extract(path):
 
 def payroll_evidence(text):
     """Independent payroll fields; one salary mention alone is not a payslip."""
-    compact=re.sub(r'\s+','',text).lower()
-    groups=[('기본급·수당',r'기본급|연장근로수당|직책수당|basesalary|regularpay|grosspay'),
-            ('공제·보험',r'공제합계|공제총액|국민연금|건강보험|고용보험|소득세|deductions|withholding'),
-            ('실수령·차인지급',r'실수령|차인지급|차감지급|지급총액|netpay|takehomepay'),
-            ('직원·급여기간',r'사번|직원명|성명\s*[:：]|급여기간|귀속년월|지급년월|employeeid|payperiod')]
+    compact=re.sub(r'\s+','',unicodedata.normalize('NFKC',text)).lower()
+    groups=[('기본급·수당',r'기본급|기본임금|본봉|연장근로수당|직책수당|시간외수당|연장수당|급여액|총급여|지급내역|지급항목|basesalary|basicpay|regularpay|grosspay|grossearnings|earnings'),
+            ('공제·보험',r'공제합계|공제총액|공제액|공제내역|공제항목|국민연금|건강보험|고용보험|소득세|장기요양|deductions|withholding|incometax'),
+            ('실수령·차인지급',r'실수령|차인지급|차감지급|지급총액|실지급|세후급여|입금액|netpay|takehomepay|netamount|netearnings'),
+            ('직원·급여기간',r'사번|직원명|성명[:：]|근로자명|급여기간|귀속년월|귀속월|지급년월|급여지급일|employeeid|employeename|payperiod|paydate')]
     return [label for label,pattern in groups if re.search(pattern,compact)]
+
+def payroll_title(text):
+    compact=re.sub(r'\s+','',unicodedata.normalize('NFKC',text)).lower()
+    return any(re.sub(r'\s+','',word) in compact for word in KINDS['급여명세서'])
 
 def classify(name, text):
     full = (name + '\n' + text).lower()
+    if payroll_title(full): return '급여명세서'
     for kind, words in KINDS.items():
         if any(w in full for w in words):
             return kind
@@ -164,6 +176,7 @@ class Library:
                   category TEXT, status TEXT, mtime REAL, size INTEGER, scope TEXT);
                 CREATE TABLE IF NOT EXISTS moves(id TEXT PRIMARY KEY, batch TEXT, source TEXT,
                   dest TEXT, digest TEXT, state TEXT, created REAL, error TEXT);
+                CREATE TABLE IF NOT EXISTS index_versions(path TEXT PRIMARY KEY, version INTEGER);
             ''')
 
     @contextmanager
@@ -214,8 +227,8 @@ class Library:
                     key = str(p.resolve()); seen.add(key)
                     stat = p.stat()
                     with self.connect() as c:
-                        old = c.execute('SELECT * FROM files WHERE path=?', (key,)).fetchone()
-                    if not old or old['mtime'] != stat.st_mtime or old['size'] != stat.st_size:
+                        old = c.execute('SELECT f.*,COALESCE(v.version,0) AS extract_version FROM files f LEFT JOIN index_versions v ON f.path=v.path WHERE f.path=?', (key,)).fetchone()
+                    if not old or old['mtime'] != stat.st_mtime or old['size'] != stat.st_size or old['extract_version']!=EXTRACT_VERSION:
                         text, status = extract(p)
                         category = classify(p.name, text)
                         with self.mutation_lock,self.connect() as c:
@@ -223,6 +236,7 @@ class Library:
                             if (current.st_mtime_ns,current.st_size)!=(stat.st_mtime_ns,stat.st_size): continue
                             c.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?)',
                                       (key, p.name, text, category, status, stat.st_mtime, stat.st_size, str(root)))
+                            c.execute('INSERT OR REPLACE INTO index_versions VALUES(?,?)',(key,EXTRACT_VERSION))
                         row=dict(path=key,name=p.name,body=text,category=category,status=status,mtime=stat.st_mtime,size=stat.st_size,scope=str(root))
                     else: row=dict(old)
                     if on_file: on_file(row)

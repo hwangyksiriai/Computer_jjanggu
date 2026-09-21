@@ -3,7 +3,7 @@ from pathlib import Path
 import hashlib,html,json,re,zipfile
 
 BASE=Path(__file__).resolve().parent
-SOURCES=['app.py','enhancements.py','core.py','knowledge.py','bootstrap.py','local_ai.py',
+SOURCES=['app.py','easy_app.py','quick_bubble.py','ime_entry.py','single_instance.py','desktop_entry.py','enhancements.py','core.py','knowledge.py','bootstrap.py','local_ai.py','qwen_voice.py',
          'audio_input.py','desktop_room.py','file_watch.py','monitors.py','pet_bubble.py',
          'reactions.py','result_browser.py','result_refinement.py','voice_clips.py','windows_features.py',
          'setup_runtime.py','ai_worker.mjs','speech.ps1','ocr.ps1','requirements.txt','package.json','package-lock.json',

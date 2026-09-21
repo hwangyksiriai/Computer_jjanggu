@@ -104,7 +104,8 @@ class Voice:
         payload=json.dumps({'path':str(path),'volume':settings.get('volume',70)},ensure_ascii=False).encode('utf-8')
         try:
             with self.lock:
-                p=subprocess.Popen([sys.executable,str(BASE/'voice_clips.py')],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,creationflags=0x08000000)
+                command=[sys.executable,'--play-voice'] if getattr(sys,'frozen',False) else [sys.executable,str(BASE/'voice_clips.py')]
+                p=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,creationflags=0x08000000)
                 self.process=p
             def wait():
                 _,err=p.communicate(payload)
@@ -172,7 +173,7 @@ class Pet:
         self.win.wm_attributes('-transparentcolor', self.key)
         self.canvas = tk.Canvas(self.win, bg=self.key, highlightthickness=0, cursor='hand2')
         self.canvas.pack(fill='both', expand=True)
-        self.frame = 0; self.pose = None; self.until = 0; self.message = '클릭하면 내 주머니가 열려!'
+        self.frame = 0; self.pose = None; self.until = 0; self.message = '나를 누르면 바로 파일을 찾아줄게!'
         self.canvas.bind('<ButtonPress-1>', self.press)
         self.canvas.bind('<B1-Motion>', self.drag)
         self.canvas.bind('<ButtonRelease-1>', self.release)
@@ -268,12 +269,14 @@ class Pet:
             else: self.app.show('home')
     def menu(self,e):
         m = tk.Menu(self.win,tearoff=0,font=(FONT,10))
-        for name,cmd in [('주머니 열기',lambda:self.app.show('home')),('내 짱구 꾸미기',lambda:self.app.show('closet')),
+        for name,cmd in [('파일 찾기',lambda:self.app.focus_search()),('정리·설정',lambda:self.app.show('organize')),('내 짱구 꾸미기',lambda:self.app.show('closet')),
                          ('다음 모니터로 이동',self.next_monitor),
                          ('훌라훌라!',lambda:self.event('훌라훌라! 오늘도 신나게!',3)),
                          ('말소리 켜기 / 끄기',lambda:self.app.toggle_sound()),
                          ('바탕화면 아이콘 복원',lambda:self.app.icons(True)),('완전히 종료',self.app.quit)]:
             m.add_command(label=name,command=cmd)
+        if hasattr(self.app,'voice_settings'): m.add_command(label='목소리 설정',command=self.app.voice_settings)
+        if hasattr(self.app,'connect_from_bubble'): m.add_command(label='찾을 폴더 연결',command=self.app.connect_from_bubble)
         m.tk_popup(e.x_root,e.y_root)
 
 class App:
@@ -345,7 +348,8 @@ class App:
         label(self.main,'',9,MUTED,textvariable=self.status,anchor='w',wraplength=780).pack(fill='x',pady=(12,0))
 
     def show(self,page):
-        self.page=page; self.root.deiconify(); self.root.lift()
+        self.page=page
+        if not getattr(self.root,'pet_only_start',False): self.root.deiconify(); self.root.lift()
         for k,b in self.nav.items(): b.configure(bg='#FFFFFF' if k==page else '#F0EEE6',fg=ORANGE if k==page else INK)
         for child in self.content.winfo_children(): child.destroy()
         self.preview_photos=[]
@@ -530,7 +534,9 @@ class App:
         src,vault=self.source,self.vault
         def confirm():
             w.destroy(); self.run_job(lambda:self.library.move(plan,src,vault),self.cleaned,'파일을 안전하게 옮기는 중…')
-        button(w,'확인한 파일 정리하기',confirm,primary=True).pack(pady=(0,18))
+        actions=tk.Frame(w,bg=BG); actions.pack(pady=(0,18))
+        button(actions,'아직 안 할래요',w.destroy).pack(side='left',padx=8)
+        button(actions,'② 이 파일들 정리하기',confirm,primary=True).pack(side='left',padx=8)
 
     def cleaned(self,result):
         done,errors=result
@@ -719,11 +725,24 @@ class App:
         self.voice.close(); self.pool.shutdown(wait=False,cancel_futures=True); self.root.destroy()
 
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument('--data-dir'); parser.add_argument('--background',action='store_true'); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument('--data-dir'); parser.add_argument('--background',action='store_true'); parser.add_argument('--show-window',action='store_true'); args=parser.parse_args()
+    from single_instance import SingleInstance
+    instance=SingleInstance()
+    if not instance.first:
+        instance.close(); return
     enable_dpi_awareness()
-    from enhancements import EnhancedApp
-    root=tk.Tk(); app=EnhancedApp(root,args.data_dir)
-    if args.background: root.after(500,app.hide)
-    root.mainloop()
+    from easy_app import EasyApp
+    try:
+        root=tk.Tk(); root.withdraw(); root.pet_only_start=not args.show_window
+        app=EasyApp(root,args.data_dir)
+        root.pet_only_start=False
+        if not args.show_window: root.withdraw()
+        def wake():
+            if instance.requested(): app.open_desktop_search()
+            root.after(400,wake)
+        root.after(400,wake)
+        if not args.background and not args.show_window: root.after(400,app.open_desktop_search)
+        root.mainloop()
+    finally: instance.close()
 
 if __name__=='__main__': main()

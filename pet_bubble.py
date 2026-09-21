@@ -37,14 +37,14 @@ class PetBubble:
         self.entry.pack(side='left',fill='x',expand=True,padx=8,ipady=9)
         self.send_button=button(entryrow,'보내기',self.submit,primary=True); self.send_button.pack(side='right')
         self.entry.bind('<Return>',lambda e:self.submit()); self.win.bind('<Escape>',lambda e:self.close())
-        quick=tk.Frame(body,bg=WHITE); quick.pack(fill='x')
+        quick=tk.Frame(body,bg=WHITE); quick.pack(fill='x'); self.quick_bar=quick
         for text in ('인보이스 찾아줘','춤춰줘','정리해줘'):
             button(quick,text,lambda q=text:self.submit(q),bg='#F2F2F2').pack(side='left',padx=(0,4))
         self.message=tk.StringVar(value='찾고 싶은 파일이나 하고 싶은 일을 말해 줘.')
         label(body,'',11,GREEN,bold=True,textvariable=self.message,wraplength=328,justify='left',bg=WHITE).pack(anchor='w',pady=7)
         self.content=tk.Frame(body,bg=WHITE); self.content.pack(fill='both',expand=True)
         bottom=tk.Frame(body,bg=WHITE); bottom.pack(fill='x')
-        button(bottom,'주머니 크게 열기',self.open_main,bg=WHITE).pack(side='right')
+        button(bottom,'정리·설정 열기',self.open_main,bg=WHITE).pack(side='right')
         button(bottom,'결과 넓게 보기',self.open_results,bg=PALE).pack(side='left')
         self.win.update_idletasks(); self.space=DesktopSpace(self.win)
         self.win.deiconify(); self.win.attributes('-alpha',0.25); self.follow()

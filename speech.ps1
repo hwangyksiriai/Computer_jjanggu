@@ -11,7 +11,10 @@ try {
         }) | ConvertTo-Json -Compress
     } else {
         $request = [Console]::In.ReadToEnd() | ConvertFrom-Json
-        if ($request.voice) { $speaker.SelectVoice([string]$request.voice) }
+        $voices = @($speaker.GetInstalledVoices() | Where-Object Enabled)
+        $selected = $voices | Where-Object { $_.VoiceInfo.Name -eq [string]$request.voice } | Select-Object -First 1
+        if (-not $selected) { $selected = $voices | Where-Object { $_.VoiceInfo.Culture.Name -eq 'ko-KR' } | Select-Object -First 1 }
+        if ($selected) { $speaker.SelectVoice($selected.VoiceInfo.Name) }
         $speaker.Rate = [Math]::Max(-10, [Math]::Min(10, [int]$request.rate))
         $speaker.Volume = [Math]::Max(0, [Math]::Min(100, [int]$request.volume))
         if ($OutputPath) { $speaker.SetOutputToWaveFile($OutputPath) }
