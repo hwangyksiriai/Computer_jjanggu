@@ -35,8 +35,10 @@ class PetBubble:
         self.text=tk.StringVar(); entryrow=tk.Frame(body,bg=WHITE,highlightbackground='#303030',highlightthickness=1); entryrow.pack(fill='x',pady=(10,6))
         self.entry=tk.Entry(entryrow,textvariable=self.text,font=(FONT,11),relief='flat',bg=WHITE,fg=INK)
         self.entry.pack(side='left',fill='x',expand=True,padx=8,ipady=9)
-        self.send_button=button(entryrow,'보내기',self.submit,primary=True); self.send_button.pack(side='right')
-        self.entry.bind('<Return>',lambda e:self.submit()); self.win.bind('<Escape>',lambda e:self.close())
+        from ime_entry import attach
+        self.ime=attach(self.entry)
+        self.send_button=button(entryrow,'보내기',self.submit_composed,primary=True); self.send_button.pack(side='right')
+        self.entry.bind('<Return>',lambda e:self.submit_composed()); self.win.bind('<Escape>',lambda e:self.close())
         quick=tk.Frame(body,bg=WHITE); quick.pack(fill='x'); self.quick_bar=quick
         for text in ('인보이스 찾아줘','춤춰줘','정리해줘'):
             button(quick,text,lambda q=text:self.submit(q),bg='#F2F2F2').pack(side='left',padx=(0,4))
@@ -85,7 +87,8 @@ class PetBubble:
             y=screen[1]+self.HEIGHT-55
             pet.space.move(x,y)
         bx=x+pet.width/2-self.WIDTH/2; by=y-self.HEIGHT+55
-        self.space.move(*fit_position(bx,by,self.WIDTH,self.HEIGHT,[screen]))
+        position=fit_position(bx,by,self.WIDTH,self.HEIGHT,[screen])
+        if self.space.position()!=position:self.space.move(*position)
         if self.pending and not self.app.busy:
             self.pending=False
             self.send_button.configure(state='normal',text='보내기')
@@ -102,6 +105,9 @@ class PetBubble:
     def open_results(self):
         from result_browser import ResultBrowser
         ResultBrowser(self.app,self.rows)
+    def submit_composed(self):
+        if self.ime:return self.ime.commit_then(self.submit)
+        self.submit(); return 'break'
     def submit(self,query=None):
         if not self.alive(): return
         query=(query if query is not None else self.text.get()).strip()
@@ -183,8 +189,13 @@ class PetBubble:
         self.within=tk.StringVar()
         self.within_entry=tk.Entry(field,textvariable=self.within,font=(FONT,10),width=20)
         self.within_entry.pack(side='left',fill='x',expand=True,ipady=4)
-        self.within_entry.bind('<Return>',lambda e:self.refine('text',self.within.get()))
-        button(field,'결과 안에서 찾기',lambda:self.refine('text',self.within.get()),bg=PALE).pack(side='right')
+        from ime_entry import attach
+        within_ime=attach(self.within_entry)
+        def refine_text():
+            action=lambda:self.refine('text',self.within.get())
+            return within_ime.commit_then(action) if within_ime else action()
+        self.within_entry.bind('<Return>',lambda e:refine_text())
+        button(field,'결과 안에서 찾기',refine_text,bg=PALE).pack(side='right')
         label(self.content,'거래처·금액·단어 입력 / 여러 단어는 모두 포함',8,MUTED,bg=WHITE).pack(anchor='w')
         tools=tk.Frame(self.content,bg=WHITE); tools.pack(fill='x')
         button(tools,'↶ 한 단계 뒤로',lambda:self.refine('back'),state='normal' if model.steps else 'disabled').pack(side='left')

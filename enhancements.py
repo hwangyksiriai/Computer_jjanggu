@@ -115,6 +115,7 @@ class EnhancedApp(App):
             paths=self.changed_paths; self.changed_paths=set(); return paths
 
     def consume_changes(self):
+        if self.restarting:return
         if self.indexing: return
         paths=self.take_changes()
         if paths: self.reindex(only_paths=None if None in paths else paths)
@@ -262,11 +263,14 @@ class EnhancedApp(App):
                 self.result_cache=value; self.query_context=extra; self.last_submitted=query
                 if reply_surface is None: self.render_results()
                 self.last_reply=f'{len(value)}개 찾았어! 관련 후보도 함께 볼래?'
+                notice=getattr(self.library,'search_notice','')
+                if notice: self.last_reply=f'{len(value)}개 확인했어. '+notice
                 if value: self.play_action(2,self.last_reply,speak=speak)
                 else: self.pet_event('다른 단서로도 찾아볼까?',1,speak=speak)
                 if reply_surface is not None: reply_surface.results(value)
                 date_note=' 수신일은 직접 기록되거나 문서에서 확인된 값만 사용해요.' if '받은' in query else ''
                 self.status.set(('AI 분석 오류 · 본문 결과만 표시: '+self.library.ai_error[:80] if self.library.ai_error else ('로컬 AI 의미·이미지 검색 완료' if self.ai.ready() else '본문 검색 완료 · AI 모델 미준비'))+date_note)
+                if notice: self.status.set(notice)
             elif intent=='CHAT':
                 self.chat_history.extend([{'role':'user','content':query},{'role':'assistant','content':value}])
                 self.last_reply=value
@@ -516,14 +520,39 @@ class EnhancedApp(App):
             for title,path in found[:60]: button(apps,title,lambda p=path:self.open_file(p),bg=WHITE,anchor='w').pack(fill='x',pady=2)
         query.trace_add('write',render); render()
 
-    def setup_ai(self):
-        if self.busy: return
+    def setup_ai(self,capability='all'):
+        if getattr(self,'model_setup_running',False):return self.status.set('AI 준비를 계속하고 있어요. 파일 이름과 본문 검색은 사용할 수 있어요.')
+        from app_paths import runtime_root, DATA
+        import shutil
+        runtime=runtime_root()
+        probe=runtime
+        while not probe.exists():probe=probe.parent
+        if shutil.disk_usage(probe).free<5*1024**3:
+            folder=filedialog.askdirectory(parent=self.root,title='AI를 준비할 저장 공간을 골라 주세요 (여유 공간 5GB 이상)')
+            if not folder:return
+            runtime=Path(folder)/'JjangguAI'
+            if shutil.disk_usage(folder).free<5*1024**3:
+                return messagebox.showinfo('저장 공간 확인','여유 공간이 5GB 이상인 드라이브를 골라 주세요.')
+            DATA.mkdir(parents=True,exist_ok=True)
+            (DATA/'runtime.json').write_text(json.dumps({'runtime_root':str(runtime)}),encoding='utf-8')
         def work():
             from setup_runtime import install_models
-            return install_models()
+            return install_models(lambda message:self.events.put(lambda m=message:self.status.set('AI 준비 · '+m)),self.model_setup_cancel.is_set,capability=capability)
         def done(result):
-            self.status.set('로컬 AI 준비 완료! 새로 읽기로 파일을 분석할게요.'); self.reindex()
-        self.run_job(work,done,'AI 모델을 준비하는 중… 처음에는 다운로드가 필요해요.')
+            self.status.set('로컬 AI 준비 완료! 파일을 분석할게요.')
+            if capability=='photo' and hasattr(self,'resume_photo_analysis'):self.resume_photo_analysis()
+            else:self.reindex()
+        self.model_setup_running=True; self.model_setup_cancel=threading.Event()
+        self.status.set('AI 모델을 준비하는 중… 파일 이름과 본문 검색은 계속 사용할 수 있어요.')
+        def worker():
+            try:result=work();error=None
+            except Exception as exc:result=None;error=str(exc)
+            def finish():
+                self.model_setup_running=False
+                if error:self.status.set('AI 준비 중단: '+error)
+                else:done(result)
+            self.events.put(finish)
+        threading.Thread(target=worker,daemon=True).start()
 
     def configure_voice_clips(self):
         from voice_clips import EVENTS,make_clip
@@ -684,23 +713,44 @@ class EnhancedApp(App):
                 self.pet.action=1; self.pet.action_until=time.time()+5; self.next_walk=time.monotonic()+30
         finally: self.root.after(2000,self.desktop_tick)
 
+    def refresh_index_results(self):
+        if self.restarting or self.busy:return
+        query=self.query.get().strip()
+        from reactions import quick_intent
+        if query and query==self.last_submitted and quick_intent(query) not in {'CLEAN','CLOSET','DANCE','QUIET','ROOM','TRAY','LAUNCHER'}:
+            self.do_search(speak=False)
+        elif not query and self.page=='home':self.render_results()
+
     def reindex(self,only_paths=None):
+        if self.restarting:return
         if self.indexing:
             self.index_again=True; return
         self.indexing=True; self.index_cancel.clear()
         src,vault=self.source,self.vault
         def done(count):
-            self.status.set(f'{count}개 파일 분석 완료'+(' · '+self.library.ai_error[:90] if self.library.ai_error else ''))
-            if self.query.get().strip() and self.query.get().strip()==self.last_submitted and self.page=='home' and not self.busy: self.do_search(speak=False)
-            elif self.page=='home': self.render_results()
+            if self.restarting:return
+            self.status.set(f'{count}개 파일 확인 완료'+(' · '+self.library.ai_error[:90] if self.library.ai_error else ''))
+            self.refresh_index_results()
+        last_notice=0; last_refresh=0; last_phase=''
         def progress(count,name):
+            nonlocal last_notice,last_refresh,last_phase
             if self.index_cancel.is_set(): raise CancelledError()
             changes=self.take_changes()
             if changes:
                 if None in changes: self.index_again=True
                 self.library.index([src,vault],only_paths={p for p in changes if p})
-            if count%10==0: self.events.put(lambda n=count:self.status.set(f'문서 분석 중 · {n}개 처리 · 처음에는 시간이 걸릴 수 있어요.'))
-        self.status.set('백그라운드에서 파일 분석 중 · 먼저 분석된 파일부터 검색할 수 있어요.')
+            state=getattr(self.library,'index_state',{}); phase=state.get('phase','content')
+            now=time.monotonic()
+            if now-last_notice>=1 or phase!=last_phase:
+                total=state.get('total',0); completed=state.get('completed',count)
+                message=(f'파일 목록 먼저 등록 중 · {completed}개' if phase=='catalog' else
+                         f"{'본문·스캔 글자 확인' if phase=='content' else '미리보기·추가 분석'} · {completed}/{total}개 · 결과는 자동으로 갱신돼요.")
+                self.events.put(lambda text=message:self.status.set(text) if not self.busy and not self.restarting else None)
+                last_notice=now
+            if phase!='catalog' and (now-last_refresh>=10 or last_phase=='catalog'):
+                self.events.put(self.refresh_index_results); last_refresh=now
+            last_phase=phase
+        self.status.set('파일 목록을 먼저 등록하고 있어요. 본문과 스캔 글자는 이어서 확인해요.')
         future=self.index_pool.submit(lambda:self.library.index([src,vault],progress,only_paths=only_paths))
         def finished(f):
             def apply():
@@ -715,6 +765,7 @@ class EnhancedApp(App):
         future.add_done_callback(finished)
 
     def auto_tick(self):
+        if self.restarting:return
         if self.settings['auto'] and not self.busy:
             src,vault=self.source,self.vault
             def work(): return self.library.move(self.library.plan(src,vault),src,vault)
@@ -725,6 +776,7 @@ class EnhancedApp(App):
 
     def quit(self):
         if self.busy: return super().quit()
+        if getattr(self,'model_setup_cancel',None):self.model_setup_cancel.set()
         if self.watcher: self.watcher.close()
         if self.desktop_room: self.desktop_room.close()
         self.index_cancel.set(); self.index_pool.shutdown(wait=False,cancel_futures=True)

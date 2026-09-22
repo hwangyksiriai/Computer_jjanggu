@@ -13,7 +13,7 @@ class VoiceRoutingTests(unittest.TestCase):
     def test_speaks_requested_text_not_greeting(self):
         finished=threading.Event();seen=[]
         class Engine:
-            def generate(self,text,reference):seen.append((text,reference));return 'generated.wav'
+            def generate(self,text,reference,**kwargs):seen.append((text,reference));return 'generated.wav'
         messages=[];voice=Voice(messages.append);voice.qwen_client=Engine()
         with patch.object(voice,'play_clip',side_effect=lambda *a,**kw:finished.set()) as play,patch('app.subprocess.Popen') as system_tts:
             voice.say('파일 세 개를 찾았어.',{'sound':True,'voice_mode':'qwen_local','voice_reference':'reference.wav','voice_clips':{'greeting':'unrelated.wav'}})
@@ -25,11 +25,17 @@ class VoiceRoutingTests(unittest.TestCase):
     def test_cancel_discards_late_audio(self):
         started=threading.Event();release=threading.Event();done=threading.Event()
         class Engine:
-            def generate(self,*args):started.set();release.wait(3);done.set();return 'late.wav'
+            def generate(self,*args,**kwargs):started.set();release.wait(3);done.set();return 'late.wav'
         voice=Voice(lambda e:None);voice.qwen_client=Engine()
         with patch.object(voice,'play_clip') as play:
             voice.say('찾아볼게.',{'sound':True,'voice_mode':'qwen_local','voice_reference':'ref.wav'})
             self.assertTrue(started.wait(3));voice.stop();release.set();self.assertTrue(done.wait(3))
             play.assert_not_called()
+
+    def test_unrelated_original_recording_is_not_used_as_an_answer(self):
+        voice=Voice(lambda message:None)
+        with patch.object(voice,'play_clip') as play,patch('app.subprocess.Popen') as system_tts:
+            voice.say('돋보기 들고 찾아볼게!',{'sound':True,'voice_mode':'original_only','voice_clips':{'search':__file__}})
+            play.assert_not_called();system_tts.assert_not_called()
 
 if __name__=='__main__':unittest.main()

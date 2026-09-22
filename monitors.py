@@ -70,6 +70,21 @@ class DesktopSpace:
                 return point.x, point.y
         return self.window.winfo_pointerxy()
 
+    def workareas(self):
+        if not self.native:return self.screens()
+        class MONITORINFO(ctypes.Structure):
+            _fields_=[('cbSize',wintypes.DWORD),('rcMonitor',wintypes.RECT),('rcWork',wintypes.RECT),('dwFlags',wintypes.DWORD)]
+        areas=[]
+        self.u.GetMonitorInfoW.argtypes=[wintypes.HANDLE,ctypes.POINTER(MONITORINFO)]
+        @self.callback_type
+        def collect(monitor,dc,rect,data):
+            info=MONITORINFO();info.cbSize=ctypes.sizeof(info)
+            if self.u.GetMonitorInfoW(monitor,ctypes.byref(info)):
+                r=info.rcWork;areas.append((r.left,r.top,r.right,r.bottom))
+            return True
+        self.u.EnumDisplayMonitors(None,None,collect,0)
+        return sorted(areas) or self.screens()
+
     def position(self):
         if self.native:
             rect=wintypes.RECT()

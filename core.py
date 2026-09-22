@@ -20,8 +20,9 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from xml.etree import ElementTree
 
-BASE = Path(__file__).resolve().parent
+from app_paths import BASE, DATA
 EXTRACT_VERSION = 2
+PENDING_STATUS = '분석 대기 · 이름만 검색'
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'}
 TEXT_EXTS = {'.txt', '.md', '.csv', '.tsv', '.json', '.log'}
 SKIP_EXTS = {'.lnk', '.url', '.exe', '.msi', '.dll', '.sys', '.tmp', '.part', '.crdownload'}
@@ -92,7 +93,7 @@ def extract(path):
             if not missing:
                 return '\n'.join(pages)[:100_000], ('본문 분석 완료' if len(reader.pages)<=60 else '앞 60쪽 본문 분석 완료')
             import pymupdf
-            cache=BASE/'.local'/'ocr-pages'; cache.mkdir(parents=True,exist_ok=True)
+            cache=DATA/'ocr-pages'; cache.mkdir(parents=True,exist_ok=True)
             recognized=0
             with pymupdf.open(p) as doc:
                 for number in missing:
@@ -190,7 +191,10 @@ class Library:
             c.close()
 
     def index(self, roots, progress=None, on_file=None, only_paths=None):
-        count = 0
+        # Publish the complete file list before opening slow documents or running OCR.
+        # A fresh install can search names immediately, including files in later roots.
+        work = []
+        self.index_state = dict(phase='catalog', completed=0, total=0)
         for root in roots:
             root = Path(root).resolve()
             if not root.is_dir():
@@ -202,6 +206,7 @@ class Library:
             else:
                 paths = []
                 for folder, dirs, files in os.walk(root, followlinks=False):
+                    if progress: progress(len(work), '')
                     safe_dirs = []
                     for name in dirs:
                         try:
@@ -221,37 +226,62 @@ class Library:
             priority={'.pdf','.docx','.txt','.pptx','.xlsx','.png','.jpg','.jpeg'}
             paths.sort(key=lambda p:(len(p.relative_to(root).parts),p.suffix.lower() not in priority,p.name.lower()))
             seen = set()
-            for p in paths:
-                try:
-                    if progress: progress(count,p.name)
-                    key = str(p.resolve()); seen.add(key)
-                    stat = p.stat()
-                    with self.connect() as c:
-                        old = c.execute('SELECT f.*,COALESCE(v.version,0) AS extract_version FROM files f LEFT JOIN index_versions v ON f.path=v.path WHERE f.path=?', (key,)).fetchone()
-                    if not old or old['mtime'] != stat.st_mtime or old['size'] != stat.st_size or old['extract_version']!=EXTRACT_VERSION:
-                        text, status = extract(p)
-                        category = classify(p.name, text)
-                        with self.mutation_lock,self.connect() as c:
-                            current=p.stat()
-                            if (current.st_mtime_ns,current.st_size)!=(stat.st_mtime_ns,stat.st_size): continue
-                            c.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?)',
-                                      (key, p.name, text, category, status, stat.st_mtime, stat.st_size, str(root)))
-                            c.execute('INSERT OR REPLACE INTO index_versions VALUES(?,?)',(key,EXTRACT_VERSION))
-                        row=dict(path=key,name=p.name,body=text,category=category,status=status,mtime=stat.st_mtime,size=stat.st_size,scope=str(root))
-                    else: row=dict(old)
-                    if on_file: on_file(row)
-                    count += 1
-                except OSError:
-                    continue
+            for start in range(0, len(paths), 100):
+                if progress: progress(len(work), '')
+                with self.mutation_lock, self.connect() as c:
+                    for p in paths[start:start+100]:
+                        try:
+                            key=str(p.resolve()); stat=p.stat(); seen.add(key)
+                            old=c.execute('SELECT f.*,COALESCE(v.version,0) AS extract_version FROM files f LEFT JOIN index_versions v ON f.path=v.path WHERE f.path=?',(key,)).fetchone()
+                            if not old or old['mtime']!=stat.st_mtime or old['size']!=stat.st_size or old['extract_version']!=EXTRACT_VERSION:
+                                c.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?)',
+                                          (key,p.name,'',classify(p.name,''),PENDING_STATUS,stat.st_mtime,stat.st_size,str(root)))
+                                c.execute('INSERT OR REPLACE INTO index_versions VALUES(?,0)',(key,))
+                            work.append((p,root))
+                        except OSError:
+                            continue
+                self.index_state = dict(phase='catalog', completed=len(work), total=0)
             with self.mutation_lock,self.connect() as c:
                 for row in c.execute('SELECT path FROM files WHERE scope=?', (str(root),)).fetchall():
                     excluded=any(part.lower() in GENERATED_DIRS for part in Path(row['path']).relative_to(root).parts[:-1])
                     if ((only_paths is None and row['path'] in snapshot and row['path'] not in seen and (excluded or not Path(row['path']).exists())) or
                         (only_paths is not None and row['path'] in {str(Path(p).resolve()) for p in only_paths} and not Path(row['path']).exists())):
                         c.execute('DELETE FROM files WHERE path=?', (row['path'],))
+                        c.execute('DELETE FROM index_versions WHERE path=?', (row['path'],))
+        count = 0
+        phase='details' if on_file else 'content'
+        for p,root in work:
+            try:
+                self.index_state = dict(phase=phase, completed=count, total=len(work))
+                if progress: progress(count,p.name)
+                key = str(p.resolve())
+                stat = p.stat()
+                with self.connect() as c:
+                    old = c.execute('SELECT f.*,COALESCE(v.version,0) AS extract_version FROM files f LEFT JOIN index_versions v ON f.path=v.path WHERE f.path=?', (key,)).fetchone()
+                if not old or old['mtime'] != stat.st_mtime or old['size'] != stat.st_size or old['extract_version']!=EXTRACT_VERSION:
+                    text, status = extract(p)
+                    category = classify(p.name, text)
+                    with self.mutation_lock,self.connect() as c:
+                        current=p.stat()
+                        if (current.st_mtime_ns,current.st_size)!=(stat.st_mtime_ns,stat.st_size):
+                            # Do not retain text for a version that changed during extraction.
+                            c.execute('DELETE FROM files WHERE path=? AND mtime=? AND size=? AND status=?',
+                                      (key,stat.st_mtime,stat.st_size,PENDING_STATUS))
+                            continue
+                        c.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?)',
+                                  (key, p.name, text, category, status, stat.st_mtime, stat.st_size, str(root)))
+                        c.execute('INSERT OR REPLACE INTO index_versions VALUES(?,?)',(key,EXTRACT_VERSION))
+                    row=dict(path=key,name=p.name,body=text,category=category,status=status,mtime=stat.st_mtime,size=stat.st_size,scope=str(root))
+                else: row=dict(old)
+                if on_file: on_file(row)
+                count += 1
+            except OSError:
+                continue
+        self.index_state = dict(phase=phase, completed=count, total=len(work))
         return count
 
     def search(self, query='', previous='', category=None, roots=None):
+        root_paths=tuple(Path(root).resolve() for root in roots) if roots else ()
         q = query.strip().lower()
         if any(x in q for x in ('그중', '그 중', '거기서')):
             q = previous + ' ' + q
@@ -276,7 +306,7 @@ class Library:
         results = []
         for row in rows:
             r = dict(row)
-            if roots and not any(Path(r['path']).is_relative_to(Path(root).resolve()) for root in roots):
+            if root_paths and not any(Path(r['path']).is_relative_to(root) for root in root_paths):
                 continue
             if not Path(r['path']).exists():
                 continue

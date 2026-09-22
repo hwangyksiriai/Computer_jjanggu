@@ -2,10 +2,15 @@
 import contextlib,hashlib,json,os,sys
 from pathlib import Path
 base=Path(__file__).resolve().parent
-runtime=Path(json.loads((base/'.local/runtime.json').read_text('utf-8-sig'))['runtime_root'])
+state=Path(os.environ.get('JJANGGU_STATE_ROOT',str(base/'.local')))
+runtime=Path(os.environ['JJANGGU_RUNTIME_ROOT']) if os.environ.get('JJANGGU_RUNTIME_ROOT') else Path(json.loads((state/'runtime.json').read_text('utf-8-sig'))['runtime_root'])
 sys.path.insert(0,str(runtime/'qwen-packages'))
 os.environ.update(HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',HF_HOME=str(runtime/'qwen-cache'),NUMBA_CACHE_DIR=str(runtime/'qwen-numba-cache'))
 model=None; prompts={}
+# A larger model failed the Korean content benchmark. Keep it behind an explicit
+# diagnostic flag rather than silently selecting it just because it was downloaded.
+quality=os.environ.get('JJANGGU_VOICE_EXPERIMENTAL')=='1' and (runtime/'qwen3-tts-base-1.7b/provenance.json').is_file()
+engine='qwen-1.7b-int8-icl-v4' if quality else 'qwen-icl-v3'
 
 def synthesize(request):
     global model
@@ -18,32 +23,27 @@ def synthesize(request):
     text=request['text'].strip()
     if not text or len(text)>300:raise ValueError('음성 문장은 1~300자로 입력해 주세요.')
     signature=hashlib.sha256(reference.read_bytes()).hexdigest()
-    identity=json.dumps([signature,text,'qwen-0.6b-fp32-v2'],ensure_ascii=False)
-    cache=base/'.local/voice-generated';cache.mkdir(exist_ok=True)
+    ref_text=request.get('reference_text','').strip()
+    if not ref_text:raise ValueError('참고 음성에서 말하는 대사를 등록해 주세요.')
+    seed=int(request.get('seed',1234))
+    identity=json.dumps([signature,ref_text,text,seed,engine],ensure_ascii=False)
+    cache=state/'voice-generated';cache.mkdir(parents=True,exist_ok=True)
     output=cache/(hashlib.sha256(identity.encode()).hexdigest()+'.wav')
     if output.exists():return str(output)
     if model is None:
-        model=Qwen3TTSModel.from_pretrained(str(runtime/'qwen3-tts-base'),device_map='cpu',dtype=torch.float32,attn_implementation='sdpa',local_files_only=True)
+        model=Qwen3TTSModel.from_pretrained(str(runtime/('qwen3-tts-base-1.7b' if quality else 'qwen3-tts-base')),device_map='cpu',dtype=torch.float32,attn_implementation='sdpa',local_files_only=True)
+        if quality:
+            # Linear layers use dynamic int8 on CPU; embeddings and acoustic
+            # tokenizer keep their trained precision. In-place avoids a second model copy.
+            torch.ao.quantization.quantize_dynamic(model.model,{torch.nn.Linear},dtype=torch.qint8,inplace=True)
         print('VOICE_ENGINE_READY',file=sys.stderr,flush=True)
-    if signature not in prompts:
-        # In x-vector-only mode ref_code is discarded. Avoid the expensive
-        # speech-tokenizer encode that the generic helper performs regardless.
-        speaker_cache=cache/('speaker-'+signature+'.json')
-        if speaker_cache.exists():
-            embedding=torch.tensor(json.loads(speaker_cache.read_text('utf-8')),dtype=torch.float32)
-        else:
-            audio,rate=sf.read(reference,dtype='float32')
-            if audio.ndim>1:audio=audio.mean(axis=1)
-            wanted=model.model.speaker_encoder_sample_rate
-            if rate!=wanted:
-                import librosa
-                audio=librosa.resample(audio,orig_sr=rate,target_sr=wanted)
-            embedding=model.model.extract_speaker_embedding(audio=audio,sr=wanted)
-            speaker_cache.write_text(json.dumps(embedding.detach().cpu().tolist()),encoding='utf-8')
-        prompts[signature]=[VoiceClonePromptItem(ref_code=None,ref_spk_embedding=embedding,x_vector_only_mode=True,icl_mode=False,ref_text=None)]
+    prompt_key=signature+ref_text
+    if prompt_key not in prompts:
+        prompts[prompt_key]=model.create_voice_clone_prompt(ref_audio=str(reference),ref_text=ref_text,x_vector_only_mode=False)
     print('VOICE_GENERATING',file=sys.stderr,flush=True)
-    torch.manual_seed(1234)
-    wavs,rate=model.generate_voice_clone(text=text,language='Korean',voice_clone_prompt=prompts[signature],non_streaming_mode=True,max_new_tokens=max(180,min(1200,len(text)*6)))
+    torch.manual_seed(seed)
+    wavs,rate=model.generate_voice_clone(text=text,language='Korean',voice_clone_prompt=prompts[prompt_key],non_streaming_mode=False,
+                                       do_sample=True,temperature=.7,top_p=.9,repetition_penalty=1.1,max_new_tokens=max(100,min(900,len(text)*6)))
     if not len(wavs[0]):raise ValueError('생성된 음성이 비어 있습니다.')
     temp=output.with_suffix('.tmp.wav');sf.write(temp,wavs[0],rate);temp.replace(output)
     return str(output)

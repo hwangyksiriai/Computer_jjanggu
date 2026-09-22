@@ -53,7 +53,7 @@ try:
     print('result facets / text narrowing / empty undo / reset / visible controls: PASS',flush=True)
     from result_browser import ResultBrowser
     browser=ResultBrowser(app,b.rows); root.update()
-    assert len(browser.tree.get_children())==len(b.rows)
+    assert sum(len(browser.tree.get_children(group)) for group in browser.tree.get_children())==len(b.rows)
     browser.tree.selection_set('0'); root.update(); assert browser.selected()
     assert browser.body.get('1.0','end').strip()
     browser.query.set('no-such-file-zz'); browser.refresh(); root.update(); assert not browser.visible

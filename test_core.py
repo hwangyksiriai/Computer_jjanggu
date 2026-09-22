@@ -42,7 +42,8 @@ class LibraryTests(unittest.TestCase):
                 count=c.execute('SELECT COUNT(*) FROM files').fetchone()[0]
             seen.append((row['name'],count))
         self.assertEqual(self.lib.index([self.source],on_file=enriched),2)
-        self.assertEqual(seen,[('first.txt',1),('second.txt',2)])
+        # All names are available while each file's body is being processed.
+        self.assertEqual(seen,[('first.txt',2),('second.txt',2)])
         cached=[]
         self.lib.index([self.source],on_file=lambda row:cached.append(row['body']))
         self.assertEqual(cached,['Invoice amount due','second'])

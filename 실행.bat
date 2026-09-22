@@ -1,8 +1,13 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+if not exist "%~dp0desktop_entry.py" (
+  echo ZIP 전체를 압축 해제한 다음 실행하세요.
+  pause
+  exit /b 1
+)
 if exist ".venv\Scripts\pythonw.exe" (
-  start "" ".venv\Scripts\pythonw.exe" "%~dp0app.py"
+  start "" ".venv\Scripts\pythonw.exe" "%~dp0desktop_entry.py"
   exit /b 0
 )
 python -c "import bootstrap,tkinter,PIL,pypdf,tkinterdnd2,pymupdf,sounddevice" >nul 2>&1
@@ -15,4 +20,4 @@ if errorlevel 1 (
     exit /b 1
   )
 )
-start "" pythonw "%~dp0app.py"
+start "" pythonw "%~dp0desktop_entry.py"

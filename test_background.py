@@ -3,7 +3,7 @@ import unittest,tempfile,time,threading,shutil,uuid
 from pathlib import Path
 from unittest.mock import patch
 from knowledge import Knowledge
-from core import Library
+from core import Library,PENDING_STATUS
 from file_watch import FileWatch
 
 class BackgroundTests(unittest.TestCase):
@@ -38,6 +38,47 @@ class BackgroundTests(unittest.TestCase):
         with patch('core.extract',mutate): lib.index([self.src])
         self.assertEqual(lib.search()[0],[])
         lib.index([self.src]); self.assertEqual(lib.search('new')[0][0]['body'],'new content')
+    def test_all_roots_are_searchable_before_first_slow_extraction(self):
+        for name in ['a.txt','z.txt']:(self.src/name).write_text('문서',encoding='utf-8')
+        (self.vault/'last.txt').write_text('보관 문서',encoding='utf-8')
+        lib=Library(self.tmp/'state'); original=__import__('core').extract; seen=[]
+        def inspect(path):
+            if not seen:
+                rows=lib.search()[0]
+                self.assertEqual({r['name'] for r in rows},{'a.txt','z.txt','last.txt'})
+                self.assertTrue(all(r['status']==PENDING_STATUS for r in rows))
+                self.assertTrue(all(not r['body'] for r in rows))
+            seen.append(path); return original(path)
+        with patch('core.extract',inspect):lib.index([self.src,self.vault])
+        self.assertEqual(len(seen),3)
+        # A second scan must use the current text cache.
+        with patch('core.extract',side_effect=AssertionError('unexpected extraction')):
+            self.assertEqual(lib.index([self.src,self.vault]),3)
+
+    def test_cancelled_catalog_resumes_content_on_next_run(self):
+        from concurrent.futures import CancelledError
+        p=self.src/'unknown.txt'; p.write_text('급여명세서 실수령 2500000원',encoding='utf-8')
+        lib=Knowledge(self.tmp/'state')
+        def cancel(count,name):
+            if name:raise CancelledError()
+        with self.assertRaises(CancelledError):lib.index([self.src],cancel)
+        self.assertEqual(lib.rows()[0]['status'],PENDING_STATUS)
+        self.assertFalse(lib.smart_search('급여명세서 찾아줘',[self.src])[0])
+        lib.index([self.src])
+        self.assertEqual(len(lib.smart_search('급여명세서 찾아줘',[self.src])[0]),1)
+
+    def test_changed_file_cannot_use_old_ai_during_pending_analysis(self):
+        p=self.src/'unknown.txt'; p.write_text('급여명세서 실수령 2500000원',encoding='utf-8')
+        lib=Knowledge(self.tmp/'state'); lib.index([self.src])
+        with lib.connect() as c:c.execute("UPDATE knowledge SET vectors='[[1,0]]',visual='[1,0]'")
+        p.write_text('메뉴 케이크 디저트',encoding='utf-8')
+        def inspect(path):
+            row=lib.rows()[0]
+            self.assertEqual(row['body'],''); self.assertEqual(row['vectors'],[])
+            self.assertEqual(row['visual'],[]); self.assertEqual(row['thumbnail'],'')
+            return '메뉴 케이크 디저트','본문 분석 완료'
+        with patch('core.extract',inspect):lib.index([self.src])
+        self.assertFalse(lib.smart_search('급여명세서 찾아줘',[self.src])[0])
     def test_incremental_delete_keeps_unrelated_rows(self):
         a=self.src/'a.txt'; b=self.src/'b.txt'; a.write_text('a'); b.write_text('b')
         k=Knowledge(self.tmp/'state'); k.index([self.src]); a.unlink()

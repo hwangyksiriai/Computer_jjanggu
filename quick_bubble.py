@@ -1,9 +1,12 @@
 """One search field, one short status, clickable filenames. Extras live in the pet menu."""
 from pathlib import Path
 import tkinter as tk
+from tkinter import ttk
+import time
 from pet_bubble import PetBubble
 from app import label, WHITE, GREEN, INK, FONT
 from monitors import DesktopSpace
+from search_status import summary
 
 
 class QuickBubble(PetBubble):
@@ -12,6 +15,8 @@ class QuickBubble(PetBubble):
 
     def __init__(self, app):
         self.app=app; self.pending=False; self.rows=[]; self.offset=0; self.loading_token=0
+        self.text_scale=app.settings.get('text_scale',1.0)
+        self.WIDTH=round(400*self.text_scale)
         self.refinement=None; self.refining=False; self.result_buttons=[]
         self.win=tk.Toplevel(app.root); self.win.withdraw(); self.win.overrideredirect(True)
         key='#010203'; self.win.configure(bg=key); self.win.attributes('-transparentcolor',key)
@@ -19,7 +24,8 @@ class QuickBubble(PetBubble):
         self.canvas=tk.Canvas(self.win,bg=key,highlightthickness=0)
         self.canvas.pack(fill='both',expand=True)
         body=tk.Frame(self.canvas,bg=WHITE)
-        self.body_item=self.canvas.create_window(22,18,window=body,anchor='nw',width=356,height=142)
+        self.body=body
+        self.body_item=self.canvas.create_window(22,18,window=body,anchor='nw',width=self.WIDTH-44,height=142)
         head=tk.Frame(body,bg=WHITE); head.pack(fill='x',pady=(0,12))
         label(head,'뭐 찾아줄까?',18,INK,bold=True).pack(side='left')
         tk.Button(head,text='×',command=self.close,font=(FONT,16),bg=WHITE,fg=GREEN,bd=0,
@@ -36,16 +42,23 @@ class QuickBubble(PetBubble):
             bg=GREEN,fg=WHITE,activebackground=GREEN,activeforeground=WHITE,bd=0,padx=14,pady=11,cursor='hand2')
         self.send_button.pack(side='right',padx=3,pady=3)
         self.entry.bind('<Return>',lambda e:self.submit_composed()); self.win.bind('<Escape>',lambda e:self.close())
-        self.message=tk.StringVar(value='파일 이름이나 기억나는 단어를 적어 줘.')
-        self.note=label(body,'',11,GREEN,textvariable=self.message,wraplength=350,justify='left')
+        self.message=tk.StringVar(value='이름을 몰라도 돼! 문서 내용이나 사진 속 모습을 말해 줘.')
+        self.note=label(body,'',11,GREEN,textvariable=self.message,wraplength=self.WIDTH-50,justify='left')
         self.note.pack(anchor='w',pady=(10,5))
-        self.content=tk.Frame(body,bg=WHITE); self.content.pack(fill='both',expand=True)
-        self.resize(185)
+        from accessibility import scroll_page
+        self.content=scroll_page(body,WHITE)
+        self.resize(round(185*self.text_scale))
+        from accessibility import apply_fonts
+        apply_fonts(body,self.text_scale)
         if not app.settings['source']:
-            self.message.set('처음 한 번만, 찾을 곳을 연결해 줘.')
+            self.message.set('사진은 위치를 몰라도 찾아볼 수 있어! 문서는 찾을 폴더를 먼저 연결해 줘.')
             tk.Button(self.content,text='내 바탕화면 연결',command=app.connect_from_bubble,
                       font=(FONT,12,'bold'),bg='#F2F5EF',fg=GREEN,bd=0,pady=8,cursor='hand2').pack(fill='x')
             self.resize(240)
+            tk.Button(self.content,text='다른 폴더에서 찾기',command=lambda:app.choose_source(False),
+                      font=(FONT,11),bg=WHITE,fg=GREEN,bd=0,pady=5,cursor='hand2').pack(fill='x')
+            self.resize(round(280*self.text_scale))
+            apply_fonts(body,self.text_scale)
         self.win.update_idletasks(); self.space=DesktopSpace(self.win)
         self.win.deiconify(); self.win.attributes('-alpha',.25); self.follow(); self.pop(0)
         self.win.after(180,self.entry.focus_force)
@@ -62,26 +75,56 @@ class QuickBubble(PetBubble):
     def resize(self,height):
         self.HEIGHT=height; self.win.geometry(f'{self.WIDTH}x{height}')
         c=self.canvas; c.delete('outline'); bottom=height-22
-        c.create_polygon(22,2,378,2,398,22,398,bottom-20,378,bottom,22,bottom,2,bottom-20,2,22,
+        right=self.WIDTH-2;center=self.WIDTH/2
+        c.create_polygon(22,2,right-20,2,right,22,right,bottom-20,right-20,bottom,22,bottom,2,bottom-20,2,22,
                          smooth=True,splinesteps=20,fill=WHITE,outline='#CDD3C8',width=1,tags='outline')
-        c.create_polygon(182,bottom-2,200,height-2,218,bottom-2,fill=WHITE,outline='#CDD3C8',tags='outline')
-        c.create_line(182,bottom-2,218,bottom-2,fill=WHITE,width=3,tags='outline')
+        c.create_polygon(center-18,bottom-2,center,height-2,center+18,bottom-2,fill=WHITE,outline='#CDD3C8',tags='outline')
+        c.create_line(center-18,bottom-2,center+18,bottom-2,fill=WHITE,width=3,tags='outline')
         c.tag_lower('outline'); c.itemconfigure(self.body_item,height=height-48)
 
     def start_search(self):
         if not self.alive(): return
-        self.pending=True; self.clear(); self.resize(185)
-        self.message.set('찾고 있어…')
+        self.pending=True; self.clear(); self.resize(round(280*self.text_scale))
+        self.message.set('접수했어. 파일 내용을 확인하고 있어!')
+        label(self.content,'✓ '+self.app.query.get(),11,INK,wraplength=340,justify='left').pack(anchor='w',pady=5)
+        progress=ttk.Progressbar(self.content,mode='indeterminate'); progress.pack(fill='x',pady=8); progress.start(35)
+        started=time.monotonic()
+        def tick():
+            if not self.alive() or not self.pending or not progress.winfo_exists():return
+            elapsed=int(time.monotonic()-started)
+            self.message.set(f'문서 내용과 사진을 찾고 있어… {elapsed}초'+('\n처음 분석은 시간이 더 걸려. 계속 확인 중이야.' if elapsed>=10 else ''))
+            self.win.after(500,tick)
+        self.win.after(500,tick)
         self.send_button.configure(state='disabled',text='찾는 중')
+        from accessibility import apply_fonts
+        apply_fonts(self.body,self.text_scale)
 
     def draw_results(self):
         if not self.alive(): return
         self.clear(); self.result_buttons=[]
-        self.message.set(f'{len(self.rows)}개 찾았어. 이름을 누르면 열려!' if self.rows else
-                         '못 찾았어. 다른 단어로 찾아볼까?')
-        if self.app.indexing: self.message.set(f'{len(self.rows)}개 찾았어. 나머지도 확인 중…')
-        shown=self.rows[self.offset:self.offset+3]
-        self.resize(185+len(shown)*68+(38 if len(self.rows)>3 else 0))
+        if getattr(self.app,'is_photo_search',False):
+            self.message.set(self.app.photo_summary())
+            self.resize(round(330*self.text_scale))
+            for title,command in [('사진을 크게 모아 보기',self.app.open_photo_gallery),('찾을 폴더 더 추가',self.app.choose_photo_folder),('사진 분석 멈추기',self.app.cancel_photo_search)]:
+                tk.Button(self.content,text=title,command=command,font=(FONT,12,'bold'),bg='#F2F5EF',fg=GREEN,bd=0,pady=9).pack(fill='x',pady=4)
+            return
+        notice=getattr(self.app.library,'search_notice','')
+        if self.app.library.ai_error:notice='AI 분석을 완료하지 못했어요. 다시 분석을 눌러 주세요.'
+        self.message.set(summary(len(self.rows),getattr(self.app.library,'search_coverage',{}),notice,self.app.indexing,not self.app.settings['source']))
+        page_size=2 if self.text_scale>1 else 3
+        shown=self.rows[self.offset:self.offset+page_size]
+        self.resize(round((275+len(shown)*68+(38 if len(self.rows)>page_size else 0)+(45 if notice else 0))*self.text_scale))
+        toolbar=tk.Frame(self.content,bg=WHITE); toolbar.pack(fill='x',pady=(0,6))
+        tk.Button(toolbar,text='미리보기로 크게 보기',command=self.open_results,
+                  font=(FONT,11),bd=0,bg='#F2F5EF',fg=GREEN).pack(side='left')
+        if notice:
+            tk.Button(toolbar,text='사진 찾기 준비' if not self.app.ai.ready() else '다시 분석',
+                      command=self.app.setup_ai if not self.app.ai.ready() else self.app.reindex,
+                      font=(FONT,11),bd=0,bg='#F2F5EF',fg=GREEN).pack(side='right')
+        if not self.rows:
+            tk.Button(self.content,text='찾을 폴더 바꾸기',command=lambda:self.app.choose_source(False),
+                      font=(FONT,12),bg='#F2F5EF',fg=GREEN,bd=0,pady=8).pack(fill='x',pady=4)
+            self.resize(self.HEIGHT+50)
         for row in shown:
             name=row['name'] if len(row['name'])<=36 else Path(row['name']).stem[:27]+'…'+Path(row['name']).suffix
             if row.get('group')=='관련 후보': name+=' · 비슷한 문서'
@@ -90,11 +133,13 @@ class QuickBubble(PetBubble):
                 anchor='w',justify='left',wraplength=315,padx=12,pady=10,cursor='hand2')
             opener.pack(fill='x',pady=(0,7)); self.result_buttons.append(opener)
             opener.bind('<Button-3>',lambda e,r=row:self.file_menu(e,r))
-        if len(self.rows)>3:
+        if len(self.rows)>page_size:
             nav=tk.Frame(self.content,bg=WHITE); nav.pack(fill='x')
-            for title,delta,enabled in [('이전',-3,bool(self.offset)),('다음',3,self.offset+3<len(self.rows))]:
+            for title,delta,enabled in [('이전',-page_size,bool(self.offset)),('다음',page_size,self.offset+page_size<len(self.rows))]:
                 tk.Button(nav,text=title,command=lambda d=delta:self.page(d),state='normal' if enabled else 'disabled',
                     font=(FONT,11),bg=WHITE,fg=GREEN,bd=0,padx=12,pady=5).pack(side='left' if delta<0 else 'right')
+        from accessibility import apply_fonts
+        apply_fonts(self.body,self.text_scale)
 
     def file_menu(self,event,row):
         menu=tk.Menu(self.win,tearoff=False,font=(FONT,12))
@@ -102,11 +147,14 @@ class QuickBubble(PetBubble):
         menu.add_command(label='폴더에서 보기',command=lambda:self.app.reveal(row['path']))
         menu.tk_popup(event.x_root,event.y_root)
 
+    def open_results(self):
+        self.app.open_result_browser()
+
     def results(self,rows):
         super().results(rows)
         self.send_button.configure(text='찾기')
 
     def reply(self,text,sources=None):
         if not self.alive(): return
-        self.pending=False; self.clear(); self.resize(220)
+        self.pending=False; self.clear(); self.resize(round(220*self.text_scale))
         self.message.set(text[:120]); self.send_button.configure(state='normal',text='찾기')

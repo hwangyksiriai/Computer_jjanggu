@@ -6,4 +6,4 @@ if not exist ".venv\Scripts\pythonw.exe" (
   pause
   exit /b 1
 )
-start "" ".venv\Scripts\pythonw.exe" "%~dp0app.py"
+start "" ".venv\Scripts\pythonw.exe" "%~dp0desktop_entry.py"

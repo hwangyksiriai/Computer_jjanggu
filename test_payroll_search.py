@@ -42,6 +42,15 @@ class PayrollSearchTests(unittest.TestCase):
         with patch('core.extract',side_effect=AssertionError('unchanged files should stay cached')):
             self.library.index([self.source])
 
+    def test_payroll_mention_in_a_report_is_not_a_green_match(self):
+        self.file('report.txt','신고서\n'+'신고 내용 설명 '*150+'첨부: 급여명세서를 확인할 수 있습니다.')
+        self.file('note.txt','급여명세서를 요청합니다. 소득세도 확인해 주세요.')
+        self.file('attachment.txt','2026년 9월 급 여 명 세 서\n기본급 3000000\n공제총액 200000\n실수령액 2800000')
+        self.library.index([self.source])
+        rows,_=self.library.smart_search('급여명세서 찾아줘',[self.source])
+        groups={r['name']:r['group'] for r in rows}
+        self.assertEqual(groups,{'report.txt':'관련 후보','note.txt':'관련 후보','attachment.txt':'일치하는 파일'})
+
     def test_real_image_and_mixed_pdf_ocr(self):
         from PIL import Image,ImageDraw,ImageFont
         import pymupdf

@@ -10,6 +10,8 @@ import time
 from PIL import Image,ImageDraw,ImageFont
 import colorsys
 from core import Library,BASE,IMAGE_EXTS,KINDS,fingerprint,serialized,classify,payroll_evidence,payroll_title,EXTRACT_VERSION
+from visual_query import visual_intent, COLORS, OBJECTS, DETECTABLE
+from search_status import coverage_for
 
 def cosine(a,b):
     if not a or not b: return 0.0
@@ -45,14 +47,18 @@ def visual_words(query):
             '사진':'photo','영수증':'receipt','방':'bedroom','짱구':'cartoon Shin-chan','로고':'logo'}
     return ' '.join(v for k,v in words.items() if k in query)
 
-def image_colors(path):
-    counts={name:0 for name in ('red','orange','yellow','green','blue','purple','pink')}
+def image_colors(path,box=None):
+    counts={name:0 for name in ('red','orange','yellow','green','blue','purple','pink','black','white','gray')}
     try:
         with Image.open(path) as im:
+            if box:
+                w,h=im.size
+                im=im.crop((max(0,box['xmin'])*w,max(0,box['ymin'])*h,min(1,box['xmax'])*w,min(1,box['ymax'])*h))
             im=im.convert('RGB').resize((64,64))
             for r,g,b in list(im.get_flattened_data()) if hasattr(im,'get_flattened_data') else list(im.getdata()):
                 h,s,v=colorsys.rgb_to_hsv(r/255,g/255,b/255)
-                if s<.22 or v<.20: continue
+                if v<.20:counts['black']+=1;continue
+                if s<.22:counts['white' if v>.85 else 'gray']+=1;continue
                 name='red' if h<.035 or h>.96 else 'orange' if h<.10 else 'yellow' if h<.18 else 'green' if h<.48 else 'blue' if h<.72 else 'purple' if h<.84 else 'pink'
                 counts[name]+=1
         return {k:round(v/4096,3) for k,v in counts.items()}
@@ -74,6 +80,21 @@ class Knowledge(Library):
             ''')
             columns={r['name'] for r in c.execute('PRAGMA table_info(knowledge)')}
             if 'manual_fields' not in columns: c.execute("ALTER TABLE knowledge ADD COLUMN manual_fields TEXT DEFAULT '{}'")
+
+    @serialized
+    def forget_file(self,path):
+        """Remove a recycled file from this catalogue, keeping move history intact."""
+        path=str(Path(path).absolute())
+        with self.connect() as c:
+            cached=c.execute('SELECT thumbnail FROM knowledge WHERE path=?',(path,)).fetchone()
+            for table in ('files','index_versions','knowledge','tray'):
+                c.execute(f'DELETE FROM {table} WHERE path=?',(path,))
+        if cached and cached['thumbnail']:
+            thumbnail=Path(cached['thumbnail']).resolve()
+            # A corrupt catalogue must never let cleanup touch an original.
+            if thumbnail.is_relative_to(self.thumbs.resolve()) and str(thumbnail)!=path:
+                try:thumbnail.unlink(missing_ok=True)
+                except OSError:pass  # A preview may still be reading this cache.
 
     def annotate(self,path,category,tags,fields=None,keyword='',note=''):
         path=str(Path(path).resolve())
@@ -156,6 +177,10 @@ class Knowledge(Library):
                         chunks=[content[i:i+1500] for i in range(0,min(len(content),30000),1200)] or [row['name']]
                         vectors=self.ai.embed(chunks)
                     if thumb and not visual: visual=self.ai.call('image',path=thumb)
+                    if thumb and Path(path).suffix.lower() in IMAGE_EXTS and getattr(self.ai,'detector_ready',lambda:False)() and fields.get('_objects_version')!=1:
+                        detections=self.ai.call('objects',path=thumb)
+                        for detection in detections:detection['colors']=image_colors(thumb,detection['box'])
+                        fields['objects']=detections;fields['_objects_version']=1
                     self.ai_error=''
                 except Exception as e: self.ai_error=str(e)
             if not category and vectors and taught:
@@ -188,11 +213,12 @@ class Knowledge(Library):
         return super().index(roots,progress,on_file=enrich,only_paths=only_paths)
 
     def rows(self,roots=None,limit=None,offset=0):
+        root_paths=tuple(Path(root).resolve() for root in roots) if roots else ()
         with self.connect() as c:
-            query='SELECT f.*,k.vectors,k.visual,k.thumbnail,k.fields,k.tags,k.manual_category,k.note FROM files f LEFT JOIN knowledge k ON f.path=k.path'
+            query='SELECT f.*,k.signature,k.vectors,k.visual,k.thumbnail,k.fields,k.tags,k.manual_category,k.manual_fields,k.note FROM files f LEFT JOIN knowledge k ON f.path=k.path'
             params=[]
             if roots:
-                params=[str(Path(r).resolve()) for r in roots]; query+=' WHERE f.scope IN ('+','.join('?' for _ in params)+')'
+                params=[str(r) for r in root_paths]; query+=' WHERE f.scope IN ('+','.join('?' for _ in params)+')'
             query+=' ORDER BY f.mtime DESC'
             if limit is not None: query+=' LIMIT ? OFFSET ?'; params.extend([limit,offset])
             rows=c.execute(query,params).fetchall()
@@ -200,9 +226,12 @@ class Knowledge(Library):
         for r in rows:
             r=dict(r)
             if not Path(r['path']).exists(): continue
-            if roots and not any(Path(r['path']).is_relative_to(Path(root).resolve()) for root in roots): continue
+            if root_paths and not any(Path(r['path']).is_relative_to(root) for root in root_paths): continue
             for key in ('vectors','visual','tags'): r[key]=json.loads(r[key] or '[]')
             r['fields']=json.loads(r['fields'] or '{}'); r['thumbnail']=r['thumbnail'] or ''
+            if r.get('signature')!=f"{r['mtime']}:{r['size']}":
+                r['vectors']=[]; r['visual']=[]; r['thumbnail']=''
+                r['fields']=json.loads(r.get('manual_fields') or '{}')
             out.append(r)
         return out
 
@@ -212,33 +241,70 @@ class Knowledge(Library):
             row=c.execute("SELECT COUNT(*) AS total,SUM(CASE WHEN k.vectors IS NULL OR k.vectors='[]' THEN 1 ELSE 0 END) AS pending FROM files f LEFT JOIN knowledge k ON f.path=k.path WHERE f.scope IN ("+','.join('?' for _ in params)+')',params).fetchone()
         return dict(total=row['total'],pending=row['pending'] or 0)
 
-    def smart_search(self,query,roots,previous='',similar=None):
+    def smart_search(self,query,roots,previous='',similar=None,allow_model=True):
         self.ai_error=''
         q=(previous+' '+query if any(t in query for t in ('그중','그 중','거기서')) else query).strip()
         rows=self.rows(roots); exact,_=super().search(q,roots=roots)
-        self.search_coverage={'registered':len(rows),'text':sum(bool(r['body'].strip()) for r in rows),
-                              'semantic':sum(bool(r['vectors']) for r in rows)}
+        vision=visual_intent(q)
+        object_vectors={}
+        self.search_notice=''
+        image_exts=getattr(self,'photo_extensions',IMAGE_EXTS)
+        self.search_coverage=coverage_for(rows,image_exts)
+        self.search_coverage['roots']=[str(Path(root).resolve()) for root in roots]
         exact_paths={r['path'] for r in exact}; tag_names=re.findall(r'#([^\s]+)',q)
         if not q and not similar:
             for r in rows: r.update(reason=r['status'],group='전체',score=1,evidence=r['body'][:180])
             return rows,q
-        qvec=None; vvec=None; source=next((r for r in rows if r['path']==similar),None)
+        qvec=None; vvec=None; scene_vectors={};source=next((r for r in rows if r['path']==similar),None)
+        def prepared(capability):
+            return bool(self.ai and (self.ai.ready_for(capability) if hasattr(self.ai,'ready_for') else self.ai.ready()))
+        if not hasattr(self,'_photo_query_plans'):self._photo_query_plans={}
+        photo_query=vision['active'] and not vision['broad'] and not similar
+        needs_model=photo_query and bool(vision['objects'] or vision.get('scene_terms') or vision.get('scene') or not(vision['colors'] or vision.get('brightness') or vision['excluded_objects']))
+        plan=self._photo_query_plans.get(q) if photo_query else None
+        can_prepare=allow_model and (not vision['active'] or (needs_model and self.search_coverage['visual']>0))
         if source:
             qvec=source['vectors'][0] if source['vectors'] else None; vvec=source['visual']
-        elif self.ai and self.ai.ready():
+        elif plan is not None:
+            vvec,object_vectors,scene_vectors,self.ai_error=plan
+        elif self.ai and can_prepare:
             try:
                 semantic_query=q
                 if any(w in q.lower() for w in KINDS['급여명세서']):
                     semantic_query+=' 기본급 수당 공제 국민연금 건강보험 소득세 실수령액 사번 지급일 payslip gross pay deductions net pay'
-                qvec=self.ai.embed([semantic_query],query=True)[0]
+                if not vision['active'] and prepared('semantic'):qvec=self.ai.embed([semantic_query],query=True)[0]
                 translated=visual_words(q)
-                if any(t in q for t in ('색','사진','그림','표지','이미지','생긴','보이는','강아지','고양이','바다','인보이스','청구서','영수증')):
+                if vision['active'] and not vision['broad'] and prepared('vision') and (vision['objects'] or vision['colors'] or vision.get('scene_terms') or vision.get('brightness') or vision.get('scene')):
+                    vvec=self.ai.call('visual_text',text=vision['prompt'])
+                    for obj in vision['objects']:
+                        object_vectors[obj]=self.ai.call('visual_text',text='a photo of a '+obj)
+                    if vision.get('scene'):
+                        for scene in ('indoor','outdoor'):scene_vectors[scene]=self.ai.call('visual_text',text=f'a photo of an {scene} scene')
+                elif not vision.get('broad') and not vision['excluded_objects'] and prepared('vision') and any(t in q for t in ('색','사진','그림','표지','이미지','생긴','보이는','강아지','고양이','바다','인보이스','청구서','영수증')):
                     simple=bool(re.fullmatch(r'\s*(파란|파랑|빨간|빨강|초록|노란|분홍|보라)?\s*(색)?\s*(표지)?\s*(제안서|문서|사진|인보이스|청구서|영수증|강아지|고양이)\s*(찾아줘|보여줘)?\s*',q))
-                    if not translated or not simple:
+                    if (not translated or not simple) and prepared('chat'):
                         translated=self.ai.call('chat',messages=[{'role':'system','content':'Translate the user image search description into a short English phrase. Return only the English translation. /no_think'},
                                                                  {'role':'user','content':q+' /no_think'}],max_tokens=55)
-                    vvec=self.ai.call('visual_text',text=translated)
+                        # Translation's large model must not stay resident while
+                        # the same worker indexes hundreds of photos.
+                        if vision['active'] and hasattr(self.ai,'close'):self.ai.close()
+                    if translated:vvec=self.ai.call('visual_text',text=translated)
+                    elif vision['active']:self.search_notice='이 장면의 표현을 해석하려면 대화 모델을 준비하거나, 색·사물·실내·야외 단서를 추가해 주세요.'
             except Exception as e: self.ai_error=str(e)
+            if photo_query and (vvec or object_vectors or scene_vectors or self.ai_error):
+                self._photo_query_plans[q]=(vvec,object_vectors,scene_vectors,self.ai_error)
+                while len(self._photo_query_plans)>20:self._photo_query_plans.pop(next(iter(self._photo_query_plans)))
+        if vision['active']:
+            if self.ai_error:
+                self.search_notice='사진 설명을 AI로 확인하지 못했어요. 지금 확인된 결과를 먼저 보여요. 조건을 짧게 바꿔 다시 시도해 주세요.'
+            elif vision['objects'] and not prepared('vision') and self.search_coverage.get('detected',0)<self.search_coverage['images']:
+                self.search_notice='사진 속 사물을 찾으려면 AI 준비가 필요해요. 사진 찾기 준비를 눌러 주세요.'
+            elif needs_model and (not allow_model or not self.search_coverage['visual']) and plan is None:
+                self.search_notice=f"사진 {self.search_coverage['images']}개 중 {self.search_coverage['visual']}개 분석됨 · 지금 확인된 사진을 먼저 보여요. 나머지 사진과 설명은 이어서 확인하고 있어요."
+            elif needs_model and self.search_coverage['visual']<self.search_coverage['images']:
+                self.search_notice=f"사진 {self.search_coverage['images']}개 중 {self.search_coverage['visual']}개 분석됨 · 분석하지 못한 사진은 결과에서 빠질 수 있어요."
+            if not self.search_notice and any(obj in DETECTABLE for obj in vision['objects']+vision['excluded_objects']) and self.search_coverage.get('detected',0)<self.search_coverage['images']:
+                self.search_notice='사물 위치 분석이 끝난 사진과 아직 확인 전인 후보를 구분해 보여요. 사진 찾기 준비 후 다시 분석하면 더 정확해져요.'
         wanted_kind='급여명세서' if payroll_title(q) else next((k for k,words in KINDS.items() if any(t in q.lower() for t in [k]+words)),None)
         currency=next((code for code,words in [('USD',['달러','usd']),('KRW',['원화','krw']),('EUR',['유로','eur']),('JPY',['엔화','jpy'])] if any(w in q.lower() for w in words)),None)
         now=datetime.now(); start=end=None
@@ -247,10 +313,45 @@ class Knowledge(Library):
         elif '지난주' in q:
             end=(now-timedelta(days=now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0); start=end-timedelta(days=7)
         elif '최근' in q: start=now-timedelta(days=7)
+        elif '작년' in q:
+            start=datetime(now.year-1,1,1);end=datetime(now.year,1,1)
+        elif '올해' in q:start=datetime(now.year,1,1)
         date_key='received_date' if '받은' in q or '수신' in q else ('issued_date' if '발행' in q else None)
+        if vision['active'] and '찍' in q:date_key='taken_date'
         results=[]
         for r in rows:
             if r['path']==similar: continue
+            visual_match=False; detected_matches=[]
+            if vision['active'] and not similar:
+                if Path(r['path']).suffix.lower() not in image_exts: continue
+                brightness=r['fields'].get('brightness')
+                if vision.get('brightness')=='dark' and (brightness is None or brightness>.42):continue
+                if vision.get('brightness')=='bright' and (brightness is None or brightness<.58):continue
+                if vision.get('scene'):
+                    scene=vision['scene'];opposite='outdoor' if scene=='indoor' else 'indoor'
+                    if not r['visual'] or not scene_vectors or cosine(scene_vectors[scene],r['visual'])<=cosine(scene_vectors[opposite],r['visual']):continue
+                if vision.get('scene_terms') and (not vvec or not r['visual'] or cosine(vvec,r['visual'])<.24):continue
+                colors=r['fields'].get('visual_colors',{})
+                if not vision['object_color'] and any(colors.get(c,0)<vision['color_min'] for c in vision['colors']): continue
+                detected=r['fields'].get('_objects_version')==1
+                detections=r['fields'].get('objects',[])
+                if vision['excluded_objects']:
+                    if not detected:continue
+                    if any(d['label'] in DETECTABLE.get(obj,set()) and d['score']>=.65 for obj in vision['excluded_objects'] for d in detections):continue
+                if vision['objects']:
+                    failed=False
+                    for obj in vision['objects']:
+                        if obj in DETECTABLE and detected:
+                            found=[d for d in detections if d['label'] in DETECTABLE[obj] and d['score']>=.65]
+                            if vision['object_color']:found=[d for d in found if all(d.get('colors',{}).get(c,0)>=.18 for c in vision['colors'])]
+                            if not found:failed=True;break
+                            detected_matches.extend(found)
+                        elif obj not in object_vectors or not r['visual'] or cosine(object_vectors[obj],r['visual'])<.24:
+                            failed=True;break
+                        elif vision['object_color']:
+                            failed=True;break  # Global blue pixels do not establish a blue chair.
+                    if failed:continue
+                visual_match=vision['broad'] or bool(vision['colors'] or vision['objects'] or vision['excluded_objects'] or vision.get('brightness') or vision.get('scene'))
             if tag_names and not all(t in r['tags'] for t in tag_names): continue
             if currency and currency not in r['fields'].get('currencies',[]): continue
             if start:
@@ -271,12 +372,18 @@ class Knowledge(Library):
                 if not (payroll and semantic>=.86): continue
             if wanted_kind and r['manual_category'] and r['manual_category']!=wanted_kind: continue
             if tag_names and all(t in r['tags'] for t in tag_names): direct=True
-            if not (direct or type_match or payroll_candidate or semantic>=.79 or visual>=.24): continue
+            if not (visual_match or direct or type_match or payroll_candidate or semantic>=.79 or visual>=.24): continue
             if similar and not (semantic>=.78 or visual>=.70): continue
             color=next((v for k,v in {'파란':'blue','파랑':'blue','빨간':'red','빨강':'red','초록':'green','녹색':'green','노란':'yellow','분홍':'pink','보라':'purple'}.items() if k in q),None)
             color_score=r['fields'].get('visual_colors',{}).get(color,0) if color else 0
             score=(1.2 if direct else 0)+(0.30 if type_match else 0)+(semantic*.4+visual*2 if vvec else semantic)+color_score
             reasons=[]
+            if visual_match:
+                if detected_matches:reasons.append('사물 위치 확인: '+', '.join(dict.fromkeys(d['label'] for d in detected_matches)))
+                if vision['objects']: reasons.append('사진 속 사물 유사 후보: '+', '.join(next(k for k,v in OBJECTS.items() if v==obj) for obj in vision['objects']))
+                if vision['colors']: reasons.append('사진 색상: '+', '.join(f"{next(k for k,v in COLORS.items() if v==c)} 계열 {r['fields'].get('visual_colors',{}).get(c,0):.0%}" for c in vision['colors']))
+                if vision.get('brightness'):reasons.append('어두운 분위기' if vision['brightness']=='dark' else '밝은 분위기')
+                if vision.get('scene'):reasons.append('실내 모습 후보' if vision['scene']=='indoor' else '야외 모습 후보')
             if direct: reasons.append('이름·본문·태그 일치')
             if type_match: reasons.append('문서 유형 일치')
             if payroll: reasons.append('본문 단서: '+', '.join(payroll))
@@ -288,8 +395,17 @@ class Knowledge(Library):
             evidence=next((s.strip() for s in sentences if any(t.lower() in s.lower() for t in terms)),r['body'][:180])
             if payroll: evidence='급여 문서 단서: '+', '.join(payroll)+' · '+evidence
             r.update(score=score,reason=' · '.join(reasons),group='일치하는 파일' if direct or type_match else '관련 후보',evidence=evidence[:220])
-            if wanted_kind=='급여명세서' and not payroll_title(r['name']+' '+r['body']) and r['manual_category']!='급여명세서':
-                r['group']='관련 후보'
+            if vision['active']:
+                r['group']='사진' if vision['broad'] else '관련 후보';r['detected_objects']=detected_matches
+                if vision['objects'] and not detected_matches:r['reason']='사물 위치 확인 전 · '+r['reason']
+            if wanted_kind=='급여명세서':
+                payroll_match=(r['manual_category']=='급여명세서' or payroll_title(r['name']) or
+                               (payroll_title(r['body'][:600]) and len(payroll)>=2))
+                if not payroll_match:
+                    r['group']='관련 후보'
+                    # A report merely mentioning a payslip is not a confirmed payslip.
+                    if payroll_title(r['body']):
+                        r['reason']='본문에 급여명세서 언급 · 실제 급여 문서인지 미리보기로 확인해 주세요.'+(' 본문 단서: '+', '.join(payroll) if payroll else '')
             results.append(r)
         return sorted(results,key=lambda r:(r['group']=='일치하는 파일',r['score']),reverse=True),q
 

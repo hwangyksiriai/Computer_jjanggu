@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox
 from datetime import datetime
 from PIL import Image, ImageTk, ImageDraw
 from core import BASE, Library, desktop_path, set_desktop_icons, IMAGE_EXTS
+from app_paths import DATA
 from monitors import DesktopSpace, enable_dpi_awareness, fit_position, virtual_bounds
 
 BG = '#FAF8F3'; WHITE = '#FFFFFF'; INK = '#30332E'; MUTED = '#83867E'
@@ -25,7 +26,7 @@ FONT = '맑은 고딕'
 OUTFITS = ['평소의 짱구', '졸린 짱구', '탐정 짱구', '훌라 짱구']
 DEFAULTS = dict(outfit=0, accessory='없음', backdrop='크림', size=180,
                 animate=True, topmost=True, auto_outfit=True, sound=True,
-                voice='Microsoft Heami Desktop', rate=1, volume=70, auto=False,
+                voice='Microsoft Heami Desktop',voice_mode='original_only', rate=1, volume=70, auto=False,
                 source='', vault='', name='짱구', pet_x=None, pet_y=None)
 
 def label(parent, text, size=10, color=INK, bg=None, bold=False, **kw):
@@ -60,7 +61,7 @@ class Voice:
                     for part in speech_chunks(text):
                         if self.speech_token is not token:return
                         self.error_callback('짱구 답변 음성 준비 중 · 처음 생성하는 문장은 시간이 걸릴 수 있어요.')
-                        path=self.qwen_client.generate(part,reference)
+                        path=self.qwen_client.generate(part,reference,cancelled=lambda:self.speech_token is not token)
                         if self.speech_token is not token:return
                         self.error_callback('짱구 답변 음성을 재생합니다.')
                         self.play_clip(path,captured,force,preserve_request=True)
@@ -73,11 +74,13 @@ class Voice:
         from voice_clips import event_for
         clip=settings.get('voice_clips',{}).get(event_for(text))
         if settings.get('voice_mode')=='original_only':
-            if clip and Path(clip).is_file(): return self.play_clip(clip,settings,force)
+            from voice_quality import normalized
+            recorded_text=settings.get('voice_clip_texts',{}).get(event_for(text),'')
+            if clip and Path(clip).is_file() and normalized(recorded_text)==normalized(text):return self.play_clip(clip,settings,force)
             self.stop()
             self.error_callback('이 답변에 맞는 짱구 음성이 아직 없어요. 답변은 말풍선에서 확인해 주세요.')
             return
-        if clip and Path(clip).is_file():
+        if clip and Path(clip).is_file() and settings.get('voice_mode')=='reaction_clips':
             return self.play_clip(clip,settings,force)
         self.stop()
         payload = json.dumps(dict(text=text, voice=settings['voice'], rate=settings['rate'],
@@ -125,6 +128,8 @@ class Voice:
         if self.qwen_client:
             process=self.qwen_client.process
             if process and process.poll() is None:process.terminate()
+            verifier=getattr(self.qwen_client,'verifier',None)
+            if verifier:verifier.close()
 
 class Sprites:
     def __init__(self):
@@ -273,7 +278,7 @@ class Pet:
                          ('다음 모니터로 이동',self.next_monitor),
                          ('훌라훌라!',lambda:self.event('훌라훌라! 오늘도 신나게!',3)),
                          ('말소리 켜기 / 끄기',lambda:self.app.toggle_sound()),
-                         ('바탕화면 아이콘 복원',lambda:self.app.icons(True)),('완전히 종료',self.app.quit)]:
+                         ('바탕화면 아이콘 복원',lambda:self.app.icons(True)),('다시 시작',self.app.restart),('완전히 종료',self.app.quit)]:
             m.add_command(label=name,command=cmd)
         if hasattr(self.app,'voice_settings'): m.add_command(label='목소리 설정',command=self.app.voice_settings)
         if hasattr(self.app,'connect_from_bubble'): m.add_command(label='찾을 폴더 연결',command=self.app.connect_from_bubble)
@@ -281,7 +286,10 @@ class Pet:
 
 class App:
     def __init__(self, root, data=None):
-        self.root=root; self.data=Path(data or BASE/'.local'); self.data.mkdir(parents=True,exist_ok=True)
+        self.root=root; self.data=Path(data or DATA); self.data.mkdir(parents=True,exist_ok=True)
+        self.callback_observer=self.root.__dict__.get('report_callback_exception')
+        self.root.report_callback_exception=self.report_callback_exception
+        self.restarting=False; self.restart_requested=False
         self.config_path=self.data/'settings.json'; self.settings=DEFAULTS.copy()
         try: self.settings.update(json.loads(self.config_path.read_text('utf-8')))
         except (OSError,ValueError): pass
@@ -290,7 +298,7 @@ class App:
         self.sprites=Sprites(); self.voice=Voice(lambda s:self.events.put(lambda:self.status.set(s)))
         self.previous=''; self.last_query=None; self.resolved_query=''; self.page='home'; self.filter='전체'; self.query=tk.StringVar(); self.status=tk.StringVar(value='내 파일을 기억하는 작은 친구')
         self.icon_changed=False; self.preview_photos=[]; self.search_offset=0
-        self.demo=BASE/'demo_files'; self.demo.mkdir(exist_ok=True)
+        self.demo=self.data/'demo_files'; self.demo.mkdir(exist_ok=True)
         self.make_demo()
         self.root.title('짱구의 주머니 · 바탕화면 친구')
         self.root.geometry('1100x780'); self.root.minsize(980,700); self.root.configure(bg=BG)
@@ -313,7 +321,7 @@ class App:
 
     def make_demo(self):
         marker=self.data/'demo-created'
-        if marker.exists(): return
+        if marker.exists() and any(self.demo.iterdir()): return
         samples={
           '거래처A_9월.txt':'INVOICE\nInvoice No: 2026-0918\nBill to: Studio Pocket\nSubtotal: USD 1,200\nAmount due: USD 1,320\nPayment due: 2026-10-01\nDesign service for September.',
           '새 문서.txt':'청구서\n공급자: 초록 스튜디오\n공급가액: 500,000원\n청구금액: 550,000원\n지급기한: 2026년 10월 10일',
@@ -711,11 +719,34 @@ class App:
             self.status.set(f'{count}개 파일을 읽었어. 이름 대신 내용으로도 찾아봐!')
             if self.page=='home': self.render_results()
         self.run_job(lambda:self.library.index([source,vault]),finish,'파일 속 글자를 읽는 중… 이미지가 많으면 조금 걸려요.')
+    def report_callback_exception(self,exc_type,error,tb):
+        """Keep callback failures local and inspectable without blocking later results."""
+        import traceback
+        try:
+            with (self.data/'app-errors.log').open('a',encoding='utf-8') as log:
+                log.write('\n'+datetime.now().isoformat(timespec='seconds')+' UI callback error\n')
+                log.writelines(traceback.format_exception(exc_type,error,tb))
+        except (OSError,ValueError):
+            # A full/unavailable data drive must not break the event pump either.
+            pass
+        observer=getattr(self,'callback_observer',None)
+        if observer:
+            try:observer(exc_type,error,tb)
+            except Exception:pass
+
     def poll(self):
         try:
-            while True: self.events.get_nowait()()
-        except queue.Empty: pass
-        self.root.after(100,self.poll)
+            # Progress can arrive faster than Tk paints. Bound each batch so
+            # input and animation still run, even if producers keep enqueueing.
+            for _ in range(64):
+                try:callback=self.events.get_nowait()
+                except queue.Empty:break
+                try:callback()
+                except Exception as error:
+                    self.report_callback_exception(type(error),error,error.__traceback__)
+        finally:
+            try:self.root.after(10 if not self.events.empty() else 100,self.poll)
+            except tk.TclError:pass  # The final callback may have closed the app.
     def hide(self): self.root.withdraw(); self.pet.event('여기 있을게. 필요하면 날 눌러줘!',speak=False)
     def quit(self):
         if self.busy:
@@ -724,14 +755,26 @@ class App:
         self.settings['icons_hidden_by_app']=False; self.save()
         self.voice.close(); self.pool.shutdown(wait=False,cancel_futures=True); self.root.destroy()
 
+    def restart(self):
+        if self.restarting:return
+        self.restarting=True
+        self.status.set('진행 중인 작업을 안전하게 마친 뒤 다시 시작할게요.')
+        if hasattr(self,'index_cancel'):self.index_cancel.set()
+        def finish():
+            if self.busy or getattr(self,'indexing',False):
+                self.root.after(200,finish); return
+            self.restart_requested=True; self.quit()
+        finish()
+
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument('--data-dir'); parser.add_argument('--background',action='store_true'); parser.add_argument('--show-window',action='store_true'); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument('--data-dir'); parser.add_argument('--background',action='store_true'); parser.add_argument('--show-window',action='store_true'); parser.add_argument('--search',default=''); args=parser.parse_args()
     from single_instance import SingleInstance
     instance=SingleInstance()
     if not instance.first:
         instance.close(); return
     enable_dpi_awareness()
     from easy_app import EasyApp
+    restart=False
     try:
         root=tk.Tk(); root.withdraw(); root.pet_only_start=not args.show_window
         app=EasyApp(root,args.data_dir)
@@ -741,8 +784,19 @@ def main():
             if instance.requested(): app.open_desktop_search()
             root.after(400,wake)
         root.after(400,wake)
-        if not args.background and not args.show_window: root.after(400,app.open_desktop_search)
+        if args.search:
+            def first_search():
+                app.open_desktop_search();app.bubble.submit(args.search)
+            root.after(500,first_search)
+        elif not args.background and not args.show_window: root.after(400,app.open_desktop_search)
         root.mainloop()
+        restart=getattr(app,'restart_requested',False)
     finally: instance.close()
+    if restart:
+        import sys
+        command=[sys.executable] if getattr(sys,'frozen',False) else [sys.executable,str(BASE/'desktop_entry.py')]
+        env=os.environ.copy(); env['PYINSTALLER_RESET_ENVIRONMENT']='1'
+        subprocess.Popen(command+['--data-dir',str(app.data)],cwd=str(Path(sys.executable).parent if getattr(sys,'frozen',False) else BASE),
+                         env=env,creationflags=0x08000000)
 
 if __name__=='__main__': main()
