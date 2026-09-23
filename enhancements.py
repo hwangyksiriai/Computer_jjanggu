@@ -18,6 +18,8 @@ from app import App,Pet,Sprites,button,label,BG,WHITE,INK,MUTED,GREEN,ORANGE,PAL
 from core import eligible,desktop_path,fingerprint
 from knowledge import Knowledge
 from local_ai import LocalAI
+from pdf_runtime import PDF_LOCK
+from document_locations import ensure_document_roots,normalize_document_roots
 from monitors import fit_position
 from reactions import quick_intent,REACTIONS,COMPLETIONS,ACTIVITY_LABELS
 from windows_features import Hotkey,foreground_focus_reason,copy_files,get_wallpaper,set_wallpaper,launchers,startup
@@ -72,7 +74,10 @@ class EnhancedApp(App):
         self.desktop_room=None
         self.watcher=None; self.watch_roots=None; self.changed_paths=set(); self.changed_lock=threading.Lock()
         self.index_pool=ThreadPoolExecutor(max_workers=1); self.indexing=False; self.index_cancel=threading.Event(); self.index_again=False
+        self._index_roots=(); self._document_roots_migrated=False
         super().__init__(root,data)
+        self.document_roots()
+        if self._document_roots_migrated:self.save()
         for k,v in dict(shirt='기본',hat='없음',focus_auto=True,focus_manual=False,walk=False,startup=False).items(): self.settings.setdefault(k,v)
         self.sprites=LivingSprites(self.settings)
         self.pet.action=None; self.pet.action_until=0
@@ -96,18 +101,72 @@ class EnhancedApp(App):
         if self.desktop_room: self.desktop_room.close()
         self.desktop_room=DesktopRoom(self)
 
-    def ensure_watcher(self):
+    def document_roots(self):
+        if ensure_document_roots(self.settings,self.source,self.vault):
+            self._document_roots_migrated=True
+        return normalize_document_roots(self.settings.get('document_roots',[]))
+
+    def set_document_roots(self,paths):
+        self.settings['document_roots']=[str(path) for path in normalize_document_roots(paths,existing_only=False)]
+        self.save()
+        with self.changed_lock:self.changed_paths.clear()
+        self._refresh_document_watcher()
+        self.result_cache=[]
+        self.reindex()
+
+    def document_rows(self,**kwargs):
+        roots=self.document_roots()
+        return self.library.rows(roots,**kwargs) if roots else []
+
+    def document_stats(self):
+        roots=self.document_roots()
+        return self.library.stats(roots) if roots else {'total':0,'pending':0}
+
+    def search_documents(self,query,previous='',*,roots=None,**kwargs):
+        roots=self.document_roots() if roots is None else roots
+        if roots:return self.library.smart_search(query,roots,previous,**kwargs)
+        from search_status import coverage_for
+        self.library.ai_error=''
+        self.library.search_coverage={**coverage_for([],set()),'roots':[]}
+        self.library.search_notice='찾을 폴더를 연결해 주세요.'
+        return [],query
+
+    def _refresh_document_watcher(self):
         from file_watch import FileWatch
-        roots=tuple(str(p.resolve()) for p in (self.source,self.vault) if p.is_dir())
+        roots=tuple(str(p) for p in self.document_roots())
         if roots!=self.watch_roots:
             if self.watcher: self.watcher.close()
+            self.watcher=None; self.watch_roots=roots
             try:
-                self.watcher=FileWatch(roots,self.files_changed); self.watch_roots=roots
-            except Exception as e: self.status.set('자동 변경 감지 오류: '+str(e))
+                if roots:self.watcher=FileWatch(roots,lambda paths:self.files_changed(paths,roots))
+            except Exception as e:
+                self.watch_roots=None
+                self.status.set('자동 변경 감지 오류: '+str(e))
+            return True
+        return False
+
+    def ensure_watcher(self):
+        if self.restarting:return
+        previous=self.watch_roots
+        changed=self._refresh_document_watcher()
+        if changed and previous is not None:self.reindex()
         self.root.after(3000,self.ensure_watcher)
 
-    def files_changed(self,paths):
-        with self.changed_lock: self.changed_paths.update(paths)
+    def files_changed(self,paths,expected_roots=None):
+        roots=self.document_roots()
+        current=tuple(str(path) for path in roots)
+        if expected_roots is not None and expected_roots!=current:return
+        allowed=set()
+        for value in paths:
+            if value is None:
+                if roots:allowed.add(None)
+                continue
+            try:
+                path=Path(value).resolve()
+                if any(path.is_relative_to(root) for root in roots):allowed.add(str(path))
+            except (OSError,ValueError,RuntimeError):pass
+        if not allowed:return
+        with self.changed_lock:self.changed_paths.update(allowed)
         self.events.put(self.consume_changes)
 
     def take_changes(self):
@@ -145,15 +204,16 @@ class EnhancedApp(App):
         if self.page!='home': return
         for child in self.results.winfo_children(): child.destroy()
         self.preview_photos=[]
-        stats=self.library.stats([self.source,self.vault])
+        stats=self.document_stats()
         if not self.query.get().strip():
-            rows=self.library.rows([self.source,self.vault],limit=30,offset=self.search_offset)
+            rows=self.document_rows(limit=30,offset=self.search_offset)
             for r in rows: r.update(reason=r['status'],group='내 파일',evidence='',score=0)
             total=stats['total']; displayed=rows
         else:
             rows=self.result_cache; total=len(rows); displayed=rows[self.search_offset:self.search_offset+30]
         self.last_count=total; missed=stats['pending']
-        mode='샘플 체험' if not self.settings['source'] else self.source.name
+        roots=self.document_roots()
+        mode=roots[0].name if len(roots)==1 else f'{len(roots)}개 폴더' if roots else '찾을 폴더 없음'
         self.result_count.configure(text=f'{mode} · {total}개 · AI 미분석/미지원 {missed}개')
         if not rows: label(self.results,'찾은 파일이 없어요. 다른 단서를 알려줘!\n미분석 파일은 새로 읽기를 눌러 확인할 수 있어요.',11,MUTED).pack(pady=30)
         group=None
@@ -202,7 +262,7 @@ class EnhancedApp(App):
 
     def open_result_browser(self):
         from result_browser import ResultBrowser
-        ResultBrowser(self,self.result_cache if self.query.get().strip() else self.library.rows([self.source,self.vault]))
+        ResultBrowser(self,self.result_cache if self.query.get().strip() else self.document_rows())
 
     def do_search(self,speak=True,reply_surface=None):
         if self.busy:
@@ -224,6 +284,7 @@ class EnhancedApp(App):
         compact=query.replace(' ',''); context=self.query_context
         search_query=self.query_context if query==self.last_submitted else query
         search_context='' if query==self.last_submitted else context
+        search_roots=tuple(self.document_roots())
         def phase(text,activity):
             self.events.put(lambda:self.search_fx.update(phase=text,activity=activity) if self.search_fx and self.search_fx['active'] else None)
         def work_inner():
@@ -236,14 +297,14 @@ class EnhancedApp(App):
             if intent=='SEARCH':
                 phase('파일 이름과 내용에서 단서를 찾고 있어','search')
                 started=time.monotonic()
-                rows,resolved=self.library.smart_search(search_query,[self.source,self.vault],search_context)
+                rows,resolved=self.search_documents(search_query,search_context,roots=search_roots)
                 if within_paths is not None: rows=[r for r in rows if r['path'] in within_paths]
                 self.library.record_usage('search',time.monotonic()-started,len(rows))
                 return intent,rows,resolved
             if intent=='CHAT':
                 phase('관련 파일을 읽고 답을 생각하는 중이야','think')
                 if not self.ai.ready(): return intent,'말은 잘 들었어! 자유 대화는 AI 모델 준비가 필요해. 파일 찾기, 정리, 꾸미기, 춤은 도와줄 수 있어.',[]
-                nearby,_=self.library.smart_search(query,[self.source,self.vault])
+                nearby,_=self.search_documents(query,roots=search_roots)
                 data='\n'.join(f"파일 {i+1}: {r['name']}\n{r['body'][:1200]}" for i,r in enumerate(nearby[:3]))
                 response=self.ai.chat(query,data,self.chat_history)
                 return intent,response,nearby[:3]
@@ -258,6 +319,11 @@ class EnhancedApp(App):
                 raise
         def finish(result):
             intent,value,extra=result
+            if intent in ('SEARCH','CHAT') and search_roots!=tuple(self.document_roots()):
+                self.search_fx.update(active=False,outcome='changed')
+                self.result_cache=[]
+                self.do_search(speak=False,reply_surface=reply_surface)
+                return
             self.search_fx.update(active=False,outcome=('found' if value else 'empty') if intent=='SEARCH' else 'done',until=time.monotonic()+4)
             if intent=='SEARCH':
                 self.result_cache=value; self.query_context=extra; self.last_submitted=query
@@ -313,9 +379,13 @@ class EnhancedApp(App):
             def show_page():
                 if Path(row['path']).suffix.lower()=='.pdf':
                     import pymupdf
-                    with pymupdf.open(row['path']) as doc:
-                        p=doc[page_number[0]]; pix=p.get_pixmap(matrix=pymupdf.Matrix(.7,.7),alpha=False)
-                        im=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
+                    with PDF_LOCK, pymupdf.open(row['path']) as doc:
+                        p=pix=None
+                        try:
+                            p=doc[page_number[0]]; pix=p.get_pixmap(matrix=pymupdf.Matrix(.7,.7),alpha=False)
+                            im=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
+                        finally:
+                            p=pix=None
                 else: im=Image.open(row['thumbnail']).convert('RGB')
                 im.thumbnail((320,450)); photo=ImageTk.PhotoImage(im); pic.configure(image=photo); pic.image=photo
             show_page()
@@ -323,7 +393,7 @@ class EnhancedApp(App):
                 controls=tk.Frame(w,bg=BG); controls.pack(fill='x',padx=20)
                 def turn(delta):
                     import pymupdf
-                    with pymupdf.open(row['path']) as doc: page_number[0]=max(0,min(doc.page_count-1,page_number[0]+delta))
+                    with PDF_LOCK, pymupdf.open(row['path']) as doc: page_number[0]=max(0,min(doc.page_count-1,page_number[0]+delta))
                     show_page(); page_label.configure(text=f'{page_number[0]+1}쪽')
                 button(controls,'이전 쪽',lambda:turn(-1)).pack(side='left'); page_label=label(controls,'1쪽'); page_label.pack(side='left',padx=15)
                 button(controls,'다음 쪽',lambda:turn(1)).pack(side='left')
@@ -351,9 +421,13 @@ class EnhancedApp(App):
         if not accepted: self.teach(row)
     def similar(self,row):
         if self.busy: return
+        roots=tuple(self.document_roots())
         def done(result):
+            if roots!=tuple(self.document_roots()):
+                self.status.set('검색 위치가 바뀌었어요. 새 위치에서 파일을 골라 주세요.')
+                return
             self.result_cache=result[0]; self.query.set('비슷한 파일: '+row['name']); self.show('home')
-        self.run_job(lambda:self.library.smart_search('',[self.source,self.vault],similar=row['path']),done,'내용과 이미지 특징이 비슷한 파일을 찾는 중…')
+        self.run_job(lambda:self.search_documents('',roots=roots,similar=row['path']),done,'내용과 이미지 특징이 비슷한 파일을 찾는 중…')
 
     def teach(self,row):
         w=tk.Toplevel(self.root); w.title('내 기준 알려주기'); w.geometry('550x660'); w.configure(bg=BG)
@@ -723,41 +797,58 @@ class EnhancedApp(App):
 
     def reindex(self,only_paths=None):
         if self.restarting:return
+        roots=tuple(self.document_roots())
         if self.indexing:
-            self.index_again=True; return
+            self.index_again=True
+            if roots!=self._index_roots:self.index_cancel.set()
+            return
+        if not roots:
+            self.index_again=False
+            self.take_changes()
+            self.search_documents('')
+            self.status.set('찾을 폴더를 연결해 주세요.')
+            self.refresh_index_results()
+            return
         self.indexing=True; self.index_cancel.clear()
-        src,vault=self.source,self.vault
+        self._index_roots=roots
         def done(count):
-            if self.restarting:return
+            if self.restarting or self.index_cancel.is_set() or roots!=tuple(self.document_roots()):return
             self.status.set(f'{count}개 파일 확인 완료'+(' · '+self.library.ai_error[:90] if self.library.ai_error else ''))
             self.refresh_index_results()
+        def check_cancelled(*args):
+            if roots!=tuple(self.document_roots()):
+                self.index_again=True
+                self.index_cancel.set()
+            if self.index_cancel.is_set():raise CancelledError()
         last_notice=0; last_refresh=0; last_phase=''
         def progress(count,name):
             nonlocal last_notice,last_refresh,last_phase
-            if self.index_cancel.is_set(): raise CancelledError()
+            check_cancelled()
             changes=self.take_changes()
             if changes:
                 if None in changes: self.index_again=True
-                self.library.index([src,vault],only_paths={p for p in changes if p})
+                updates={p for p in changes if p and any(Path(p).is_relative_to(root) for root in roots)}
+                if updates:self.library.index(roots,check_cancelled,only_paths=updates)
             state=getattr(self.library,'index_state',{}); phase=state.get('phase','content')
             now=time.monotonic()
             if now-last_notice>=1 or phase!=last_phase:
                 total=state.get('total',0); completed=state.get('completed',count)
                 message=(f'파일 목록 먼저 등록 중 · {completed}개' if phase=='catalog' else
                          f"{'본문·스캔 글자 확인' if phase=='content' else '미리보기·추가 분석'} · {completed}/{total}개 · 결과는 자동으로 갱신돼요.")
-                self.events.put(lambda text=message:self.status.set(text) if not self.busy and not self.restarting else None)
+                self.events.put(lambda text=message:self.status.set(text) if not self.busy and not self.restarting and roots==tuple(self.document_roots()) else None)
                 last_notice=now
             if phase!='catalog' and (now-last_refresh>=10 or last_phase=='catalog'):
-                self.events.put(self.refresh_index_results); last_refresh=now
+                self.events.put(lambda:self.refresh_index_results() if roots==tuple(self.document_roots()) else None); last_refresh=now
             last_phase=phase
         self.status.set('파일 목록을 먼저 등록하고 있어요. 본문과 스캔 글자는 이어서 확인해요.')
-        future=self.index_pool.submit(lambda:self.library.index([src,vault],progress,only_paths=only_paths))
+        future=self.index_pool.submit(lambda:self.library.index(roots,progress,only_paths=only_paths))
         def finished(f):
             def apply():
                 self.indexing=False
                 try: done(f.result())
                 except CancelledError: pass
-                except Exception as e: self.status.set('파일 분석 오류: '+str(e))
+                except Exception as e:
+                    if roots==tuple(self.document_roots()):self.status.set('파일 분석 오류: '+str(e))
                 if self.index_again:
                     self.index_again=False; self.reindex()
                 else: self.consume_changes()

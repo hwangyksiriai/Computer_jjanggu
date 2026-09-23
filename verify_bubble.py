@@ -53,13 +53,36 @@ try:
     print('result facets / text narrowing / empty undo / reset / visible controls: PASS',flush=True)
     from result_browser import ResultBrowser
     browser=ResultBrowser(app,b.rows); root.update()
-    assert sum(len(browser.tree.get_children(group)) for group in browser.tree.get_children())==len(b.rows)
-    browser.tree.selection_set('0'); root.update(); assert browser.selected()
-    assert browser.body.get('1.0','end').strip()
-    browser.query.set('no-such-file-zz'); browser.refresh(); root.update(); assert not browser.visible
-    browser.reset(); root.update(); assert browser.visible
+    assert len(browser.visible)==len(b.rows)
+    assert len(browser.file_buttons)==len(browser.displayed_rows) and browser.file_buttons
+    selected_path=browser.displayed_rows[0]['path']
+    opened_before=len(opened)
+    browser.file_buttons[0].invoke(); root.update()
+    assert browser.selected()['path']==selected_path and len(opened)==opened_before, 'one click selects a preview without opening the original'
+    deadline=time.monotonic()+8
+    while browser.photo is None and not browser.body.get('1.0','end').strip() and time.monotonic()<deadline:
+        root.update(); time.sleep(.03)
+    assert browser.photo is not None or browser.body.get('1.0','end').strip(), 'selected file must have a visual or readable text preview'
+    browser.open_button.invoke(); assert opened[-1]==selected_path
+    initial_query=browser.search_query
+    assert browser.query.get()==initial_query, 'search input must contain the original request'
+    with patch.object(app,'do_search') as submit:
+        browser.query.set('no-such-file-zz'); browser.submit_search()
+        deadline=time.monotonic()+1
+        while not submit.called and time.monotonic()<deadline:
+            root.update(); time.sleep(.03)
+        submit.assert_called_once_with(speak=False)
+        assert app.query.get()=='no-such-file-zz' and browser.search_query=='no-such-file-zz'
+        browser.update_results([],browser.search_query); root.update(); assert not browser.visible and browser.selected() is None
+        browser.query.set(''); browser.submit_search()
+        for _ in range(4): root.update(); time.sleep(.03)
+        assert submit.call_count==1, 'empty input must not submit a search'
+        assert browser.search_query=='no-such-file-zz', 'empty input must preserve the active search'
+    browser.update_results(b.rows,initial_query); root.update(); assert not browser.visible, 'stale responses must not replace the active search'
+    browser.update_results(b.rows,browser.search_query); root.update(); assert len(browser.visible)==len(b.rows)
+    app.query.set(initial_query)
     browser.win.destroy()
-    print('wide results / selection preview / filter / reset: PASS',flush=True)
+    print('file cards / selection preview / explicit open / global search submit / empty input / current-query updates: PASS',flush=True)
     b.submit('그중 달러로 된 것만'); idle()
     assert b.rows and all('USD' in r['body'] for r in b.rows)
     b.submit('춤춰줘'); idle(); assert app.pet.action==2 and root.state()=='withdrawn'

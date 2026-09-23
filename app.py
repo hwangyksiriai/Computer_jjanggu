@@ -477,8 +477,12 @@ class App:
         button(actions,'폴더에서 보기',lambda:self.reveal(row['path'])).pack(side='left')
 
     def open_file(self,path):
-        try: os.startfile(path)
-        except OSError as e: messagebox.showerror('열 수 없어요',str(e))
+        try:
+            os.startfile(path)
+            return True
+        except OSError as e:
+            messagebox.showerror('열 수 없어요',str(e))
+            return False
     def reveal(self,path):
         subprocess.Popen(['explorer.exe','/select,',str(Path(path))])
 

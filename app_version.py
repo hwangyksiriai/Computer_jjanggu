@@ -3,7 +3,7 @@ import hashlib
 from pathlib import Path
 import sys
 
-VERSION='2026.09.22.8'
+VERSION='2026.09.23.6'
 
 def source_stamp():
     if getattr(sys,'frozen',False):return VERSION

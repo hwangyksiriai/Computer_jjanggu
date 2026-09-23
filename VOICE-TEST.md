@@ -1,5 +1,19 @@
 # 첨부 영상 기반 로컬 음성 시험
 
+## 2026-09-23 · 현재 PC 적용
+
+사용자가 지정한 YouTube 영상 `9_chsLdUHog`의 6.6–11.7초 구간을 참고로 Qwen 0.6B/CPU 음성을 준비했다. 참고 대사는 “안녕! 그럼 훈이 기다리면서 간식이라도 먹고 있어야지!”이며, 원본 및 생성 음성은 개인 데이터에만 저장한다.
+
+- 실제 앱 문장 네 개: “뭘 찾아줄까?”, “돋보기 들고 찾아볼게!”, “후보 파일 3개를 찾았어. 미리보기로 확인해 봐!”, 결과 없음 안내가 로컬 Whisper 내용 검사를 통과했다.
+- 결과 1·2·4·5·6개 안내도 추가로 정확하게 인식되어, 인사/검색/결과 없음과 결과 1~6개까지 총 9종을 현재 PC에 미리 저장했다.
+- “세 개 후보”는 “세계 후보”로 인식되어 숫자 검사에서 차단됐다. 숫자 검사는 유지하고 실제 안내를 “후보 파일 세 개를 찾았어”로 바꿨다. 새 문장은 재시도 후 숫자를 포함해 정확히 인식됐다.
+- 현재 PC 설정에 `qwen_local`과 참고 음성, 검증된 문장 캐시를 연결했다. 같은 인사/검색 안내의 캐시 조회는 0.1초 미만이었다. 첫 문장 로딩·합성·검사는 약 70초, 준비된 엔진의 새 문장은 약 30초 이상이며 재시도 시 더 걸린다.
+- ASR 검사는 발화 내용과 숫자를 확인한다. 짱구와의 음색 유사성을 자동으로 입증하지 않으며 모든 자유 발화의 성공을 보장하지 않는다. 답변과 다르게 인식된 음성은 재생하지 않는다.
+- 독립 Python의 빌드 도구 누락, Torch 중복 설치, Windows 긴 경로 제한을 수정했다. 다운로드는 취소/무결성 검사와 이어서 준비를 지원하며, 음성 인식 중 취소도 다음 요청을 막지 않는다.
+- 로컬 음성 적용판은 `build_windows.py --onedir`로 만든다. 한 파일 실행판은 음성 재생 자식 프로세스를 열 때마다 런타임 압축을 풀어 대기 시간이 늘어나므로, 빠른 재생판은 `_internal` 폴더를 함께 둔다.
+
+아래는 이전 PC/엔진의 시험 기록이다.
+
 ## Qwen 엔진 추가 검증
 
 - 공식 Qwen3-TTS-12Hz-0.6B-Base의 고정 revision `5d83992436eae1d760afd27aff78a71d676296fc`를 D:에 설치. 입력 파일을 외부에 업로드하지 않고 HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE로 추론.
@@ -10,8 +24,8 @@
 
 2026-09-18. 사용자 제공 MP4(31.856초)에서 24kHz 모노 WAV를 로컬로 추출했습니다. 영상·음성은 외부로 업로드하지 않았습니다.
 
-- 분리 환경: D:\ShinchanPocketRuntime\desktop-pet\voice-env (Python 3.12, torch/torchaudio 2.8 CPU, coqui-tts 0.27.5, transformers 4.57.6).
-- 공식 XTTS-v2 모델 다운로드 완료. 모델 revision과 출처는 D:\ShinchanPocketRuntime\desktop-pet\xtts-v2\provenance.json.
+- 분리 환경: `<런타임 폴더>/voice-env` (Python 3.12, torch/torchaudio 2.8 CPU, coqui-tts 0.27.5, transformers 4.57.6).
+- 공식 XTTS-v2 모델 다운로드 완료. 모델 revision과 출처는 `<런타임 폴더>/xtts-v2/provenance.json`.
 - 첫 합성: “뭘 찾아줄까? 찾고 싶은 파일을 말해 줘.”를 입력하여 4.875초 WAV 생성. 모델 로딩 이후 합성 23.125초.
 - 출력: .local/voice-reference/synthetic-preview.wav. AI가 새로 합성한 시험본이며 원본 녹음이 아님.
 - 파형은 정상적으로 생성됐으나 작은 로컬 Whisper가 “잘 부탁드립니다.”로 인식해, 요청 문장의 발음과 일치한다고 검증하지 못했습니다. 원본 참고 음성 역시 인식 결과가 짧아 자동 인식만으로 원인을 단정할 수 없습니다.
@@ -31,7 +45,7 @@ XTTS 모델은 Coqui Public Model License를 사용하며, 배포 시 모델·�
 - 세 시험본의 로컬 Whisper 결과는 각각 “감사합니다!”, “저거...”, “하...”. 음성 인식 자체의 한계는 있지만 요청 문장 일치 검증은 세 건 모두 실패. 음색 유사성 개선도 확인하지 못함.
 - 결과 `.local/voice-reference/comparison/verification.json`. 앱 음성에 미적용. 원본 추가 요청이나 같은 설정 반복보다 다른 합성 엔진 검토가 필요.
 
-- 입력: `C:/Users/User/Downloads/ㅁㄴㅇㄻㄴㄻㄴ.mp4`, 41.911초. 원본 보존, `.local/voice-reference/new-reference.wav`에 로컬 추출.
+- 입력: 사용자 제공 참고 영상, 41.911초. 원본 보존, `.local/voice-reference/new-reference.wav`에 로컬 추출.
 - 새 참고 음성으로 “알았어. 인보이스 찾아볼게.” 합성. 출력 `new-search-trial.wav` 3.339초. 로컬 Whisper 인식: “진짜 진짜…”. 인식 오류 가능성은 있으나 문장 정확성 미검증으로 앱에 미적용. 원본만 원인이라고 단정할 수 없음.
 - 시험 결과 `new-trial-report.json`, 원본 구간별 인식 `new-transcript.json`에 기록. 시험 도구에 reference/output/text CLI 인자 추가.
 

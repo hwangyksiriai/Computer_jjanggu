@@ -16,10 +16,38 @@ class QwenVoiceClient:
             self.process=None
             if self.verifier:self.verifier.close();self.verifier=None
 
-    def generate(self,text,reference,cancelled=lambda:False):
-        from voice_quality import content_check,transcribe_wav,speech_text
-        from voice_runtime import voice_python
+    def _transcribe(self,path,cancelled):
         from local_ai import LocalAI
+        from voice_quality import transcribe_wav
+        self.verifier=self.verifier or LocalAI()
+        verifier=self.verifier
+        previous_cancelled=verifier.cancelled
+        verifier.cancelled=cancelled
+        finished=threading.Event()
+        # LocalAI.call waits for its pipe reply. Interrupt only this verifier,
+        # without waiting for the generation lock held by this request.
+        def watch():
+            while not finished.wait(.05):
+                if cancelled():
+                    verifier.interrupt()
+                    return
+        watcher=threading.Thread(target=watch,daemon=True)
+        watcher.start()
+        try:
+            if cancelled():raise RuntimeError('이전 음성 요청이 취소됐어요.')
+            heard=transcribe_wav(verifier,path)
+            if cancelled():raise RuntimeError('이전 음성 요청이 취소됐어요.')
+            return heard
+        finally:
+            finished.set()
+            # Joining before releasing the request lock prevents this watcher
+            # from interrupting the next request when cancellation races a reply.
+            watcher.join()
+            verifier.cancelled=previous_cancelled
+
+    def generate(self,text,reference,cancelled=lambda:False):
+        from voice_quality import content_check,speech_text
+        from voice_runtime import voice_python
         text=speech_text(text)
         with self.lock:
             if cancelled():raise RuntimeError('이전 음성 요청이 취소됐어요.')
@@ -60,8 +88,7 @@ class QwenVoiceClient:
                     path=Path(response['path']).resolve()
                     if not path.is_relative_to(cache.resolve()) or not path.is_file():raise RuntimeError('음성 파일 경로가 올바르지 않아요.')
                     if cancelled():raise RuntimeError('이전 음성 요청이 취소됐어요.')
-                    self.verifier=self.verifier or LocalAI()
-                    check=content_check(text,transcribe_wav(self.verifier,path))
+                    check=content_check(text,self._transcribe(path,cancelled))
                     path.with_suffix('.quality.json').write_text(json.dumps(dict(check,expected=text),ensure_ascii=False),encoding='utf-8')
                     if check['ok']:
                         receipt.write_text(json.dumps(dict(check,path=str(path),text=text,sha256=hashlib.sha256(path.read_bytes()).hexdigest()),ensure_ascii=False),encoding='utf-8')

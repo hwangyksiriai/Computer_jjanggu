@@ -6,6 +6,13 @@ from tkinter import filedialog,simpledialog,messagebox
 from app import label,button,BG,GREEN
 from accessibility import fit_window,scroll_page,apply_fonts
 
+def _transcribe_reference(path):
+    from voice_quality import transcribe_wav
+    from local_ai import LocalAI
+    ai=LocalAI()
+    try:return transcribe_wav(ai,path) if ai.ready_for('speech') else ''
+    finally:ai.close()
+
 def show(app):
     win=tk.Toplevel(app.root);win.title('짱구 목소리 · 새 문장 말하기');win.configure(bg=BG)
     fit_window(win,640,650)
@@ -69,13 +76,8 @@ def show(app):
         destination=app.data/'voice-reference'/(uuid.uuid4().hex+'.wav')
         def extract():
             from voice_clips import make_clip
-            from voice_quality import transcribe_wav
-            from local_ai import LocalAI
             make_clip(source,start,end,destination)
-            ai=LocalAI()
-            try:heard=transcribe_wav(ai,destination) if ai.ready() else ''
-            finally:ai.close()
-            return heard
+            return _transcribe_reference(destination)
         def connected(heard):
             reference.set(str(destination));transcript.set(heard);state['verified']=None
             status.set('참고 음성을 들어보고 아래 대사가 실제 말과 같은지 고쳐 주세요.')

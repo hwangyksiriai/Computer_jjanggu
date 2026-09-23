@@ -19,7 +19,7 @@ class PhotoController:
         self.photo_ai.cancelled=self.photo_cancel.is_set
         self.photo_indexing=False;self.photo_searching=False;self.photo_epoch=0
         self.photo_history=[];self.photo_resolved='';self.photo_similar=None
-        self.photo_last_refresh=0;self.photo_gallery=None
+        self.photo_last_refresh=0;self.photo_gallery=None;self.saved_photo_gallery=None
         self.photo_scan_roots=[];self.photo_pending_refresh=False
         self.photo_reused=False
         self.photo_deleting=set();self.photo_removed=set();self.photo_removal_generation=0
@@ -166,6 +166,17 @@ class PhotoController:
             self.photo_gallery.refresh();self.photo_gallery_reset_filters=False
         self.photo_gallery.request.configure(text='현재 조건: '+self.photo_resolved)
 
+    def open_saved_photos(self):
+        """Open saved references without changing any active search session."""
+        from photo_gallery import PhotoGallery
+        gallery=getattr(self,'saved_photo_gallery',None)
+        if gallery and not gallery._closed and gallery.win.winfo_exists():
+            gallery.reload_saved();gallery.show_saved(True)
+            gallery.win.deiconify();gallery.win.lift()
+        else:
+            gallery=self.saved_photo_gallery=PhotoGallery(self,[],query='',saved_context=True)
+        return gallery
+
     def open_result_browser(self):
         if getattr(self,'is_photo_search',False):return self.open_photo_gallery()
         return super().open_result_browser()
@@ -232,10 +243,17 @@ class PhotoController:
                     result=recycle_photo(dict(row))
                     if result.get('ok'):
                         warnings=[]
+                        # Keep saved references consistent even if all gallery
+                        # windows close before this worker finishes.
+                        memory=getattr(self,'file_memory',None)
+                        if memory is not None:
+                            try:memory.unsave_photo(path)
+                            except Exception:
+                                result['warning']='휴지통으로 보냈지만 찜 목록은 바꾸지 못했어요. 찜 해제를 다시 눌러 주세요.'
                         for library in (self.library,self.photo_library):
                             try:library.forget_file(path)
                             except Exception as error:warnings.append(str(error))
-                        if warnings:result['warning']='휴지통으로 보냈어요. 목록이 남아 있으면 다시 검색해 주세요.'
+                        if warnings and not result.get('warning'):result['warning']='휴지통으로 보냈어요. 목록이 남아 있으면 다시 검색해 주세요.'
                 if result.get('ok'):
                     try:result['coverage']=self.photo_library.coverage(self.photo_search_roots())
                     except Exception:pass

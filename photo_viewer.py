@@ -42,6 +42,14 @@ def _load_photo(row, size):
         can_reveal = bool(original) and Path(original).parent.is_dir()
     except OSError:
         can_reveal = False
+    if row.get('_saved_reference'):
+        from photo_gallery import _decode_saved
+        picture, problem = _decode_saved(row, size)
+        if problem:
+            return None, problem + ' · 찜 목록에서 해제할 수 있어요.', False, False
+        message = ('사진 전체를 화면에 맞춰 보여드려요.' if picture is not None else
+                   '이 사진의 미리보기를 만들 수 없어요. 원본 열기로 확인해 주세요.')
+        return picture, message, True, can_reveal
     if original_exists:
         picture = _decode_sources((original,), size)
         if picture is not None:
@@ -189,11 +197,12 @@ class PhotoViewer:
         self.win.title(f'{name[:90]} · 사진 크게 보기')
         # Background result updates call show too. Only the gallery's explicit
         # open action should raise this window or move keyboard focus into it.
-        self._request()
+        self._request(force=bool(row.get('_saved_reference')))
 
     @staticmethod
     def _source_key(row):
-        return tuple(row.get(key) for key in ('path', 'mtime', 'size', 'status', 'thumbnail'))
+        return tuple(row.get(key) for key in ('path', 'mtime', 'size', 'status', 'thumbnail',
+                    '_saved_reference', 'available', 'saved_mtime_ns', 'saved_size', 'saved_ino', 'saved_dev'))
 
     def _fit_captions(self):
         # Fixed one-line captions preserve photo space even with a very long
@@ -212,7 +221,7 @@ class PhotoViewer:
                 text = text[:low] + '…'
             label.configure(text=text)
 
-    def _request(self):
+    def _request(self, force=False):
         if self._resize_id:
             self.win.after_cancel(self._resize_id)
         self._resize_id = None
@@ -220,7 +229,7 @@ class PhotoViewer:
             return
         self._size = (max(120, self.canvas.winfo_width() - 20), max(100, self.canvas.winfo_height() - 20))
         request_key = self._source_key(self.row), self._size
-        if request_key == self._requested_key:
+        if not force and request_key == self._requested_key:
             return
         self._requested_key = request_key
         self._token += 1
@@ -228,8 +237,18 @@ class PhotoViewer:
         path = self.row.get('path')
         for job in list(self._jobs):
             job.cancel()
+        if self.row.get('_saved_reference'):
+            # Every saved-photo resize/navigation revalidates the original;
+            # do not keep old pixels or actions active during that check.
+            self.canvas.delete('all')
+            self.photo = None
+            self.open_button.configure(state='disabled')
+            self.reveal_button.configure(state='disabled')
+            self._can_delete = False
+            self.set_delete_pending(self._delete_pending)
         future = self._pool.submit(_load_photo, dict(self.row), self._size)
         self._jobs.add(future)
+        output = self._queue
 
         def done(job):
             if job.cancelled():
@@ -238,7 +257,7 @@ class PhotoViewer:
                 result = job.result()
             except Exception:
                 result = (None, '사진을 불러오지 못했어요. 저장된 폴더에서 다시 확인해 주세요.', False, False)
-            self._queue.put((token, path, result))
+            output.put((token, path, result))
 
         future.add_done_callback(done)
 

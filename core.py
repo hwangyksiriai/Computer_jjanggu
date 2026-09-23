@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from xml.etree import ElementTree
 
 from app_paths import BASE, DATA
+from pdf_runtime import PDF_LOCK
 EXTRACT_VERSION = 2
 PENDING_STATUS = '분석 대기 · 이름만 검색'
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'}
@@ -95,19 +96,21 @@ def extract(path):
             import pymupdf
             cache=DATA/'ocr-pages'; cache.mkdir(parents=True,exist_ok=True)
             recognized=0
-            with pymupdf.open(p) as doc:
-                for number in missing:
-                    image=cache/(uuid.uuid4().hex+'.png')
-                    try:
+            for number in missing:
+                image=cache/(uuid.uuid4().hex+'.png')
+                try:
+                    with PDF_LOCK, pymupdf.open(p) as doc:
                         doc[number].get_pixmap(matrix=pymupdf.Matrix(1.5,1.5),alpha=False).save(image)
-                        page_text,_=extract(image)
-                        if page_text:
-                            pages[number]+='\n'+page_text; recognized+=1
-                    finally:
-                        if image.exists(): image.unlink()
-                text='\n'.join(pages)[:100_000]
-                return text, ('본문·이미지 글자 분석 완료' if recognized and len(reader.pages)<=12 else
-                              ('본문 분석·OCR 일부 범위' if text.strip() else '스캔 PDF · 인식된 글자 없음'))
+                    # Windows OCR can take seconds; previews need the PDF guard
+                    # only while native pages are being rendered, not during OCR.
+                    page_text,_=extract(image)
+                    if page_text:
+                        pages[number]+='\n'+page_text; recognized+=1
+                finally:
+                    if image.exists(): image.unlink()
+            text='\n'.join(pages)[:100_000]
+            return text, ('본문·이미지 글자 분석 완료' if recognized and len(reader.pages)<=12 else
+                          ('본문 분석·OCR 일부 범위' if text.strip() else '스캔 PDF · 인식된 글자 없음'))
         if ext in {'.pptx','.xlsx'}:
             with zipfile.ZipFile(p) as z:
                 names=[n for n in z.namelist() if (n.startswith('ppt/slides/slide') or n=='xl/sharedStrings.xml' or n.startswith('xl/worksheets/sheet')) and n.endswith('.xml')]
@@ -237,6 +240,10 @@ class Library:
                                 c.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?)',
                                           (key,p.name,'',classify(p.name,''),PENDING_STATUS,stat.st_mtime,stat.st_size,str(root)))
                                 c.execute('INSERT OR REPLACE INTO index_versions VALUES(?,0)',(key,))
+                            elif old['scope']!=str(root):
+                                # Folder selections can change without changing a file.
+                                # Keep cached contents visible under the new selection.
+                                c.execute('UPDATE files SET scope=? WHERE path=?',(str(root),key))
                             work.append((p,root))
                         except OSError:
                             continue
@@ -281,10 +288,12 @@ class Library:
         return count
 
     def search(self, query='', previous='', category=None, roots=None):
-        root_paths=tuple(Path(root).resolve() for root in roots) if roots else ()
+        root_paths=None if roots is None else tuple(Path(root).resolve() for root in roots)
         q = query.strip().lower()
         if any(x in q for x in ('그중', '그 중', '거기서')):
             q = previous + ' ' + q
+        if root_paths==():
+            return [],q
         selected_kind = next((k for k, ws in KINDS.items() if any(w in q for w in [k]+ws)), None)
         terms = re.sub(r'찾아\s*줘|찾아주세요|보여\s*줘|보여주세요|파일|문서|관련|그중|그 중|거기서|것만|것들|보이는|처럼|같은|지난달|지난주|최근|달러|usd|전체|모두', ' ', q)
         if selected_kind:

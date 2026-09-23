@@ -12,6 +12,7 @@ import colorsys
 from core import Library,BASE,IMAGE_EXTS,KINDS,fingerprint,serialized,classify,payroll_evidence,payroll_title,EXTRACT_VERSION
 from visual_query import visual_intent, COLORS, OBJECTS, DETECTABLE
 from search_status import coverage_for
+from pdf_runtime import PDF_LOCK
 
 def cosine(a,b):
     if not a or not b: return 0.0
@@ -132,9 +133,13 @@ class Knowledge(Library):
                     im=im.convert('RGB'); im.thumbnail((700,900)); im.save(out)
             elif p.suffix.lower()=='.pdf':
                 import pymupdf
-                with pymupdf.open(p) as doc:
+                with PDF_LOCK, pymupdf.open(p) as doc:
                     if not doc.page_count or doc.is_encrypted: return ''
-                    page=doc[0]; pix=page.get_pixmap(matrix=pymupdf.Matrix(1.2,1.2),alpha=False); pix.save(out)
+                    page=pix=None
+                    try:
+                        page=doc[0]; pix=page.get_pixmap(matrix=pymupdf.Matrix(1.2,1.2),alpha=False); pix.save(out)
+                    finally:
+                        page=pix=None
             elif row['body']:
                 im=Image.new('RGB',(600,800),'#FFFDF7'); d=ImageDraw.Draw(im)
                 f=ImageFont.truetype('C:/Windows/Fonts/malgun.ttf',18)
@@ -213,11 +218,12 @@ class Knowledge(Library):
         return super().index(roots,progress,on_file=enrich,only_paths=only_paths)
 
     def rows(self,roots=None,limit=None,offset=0):
-        root_paths=tuple(Path(root).resolve() for root in roots) if roots else ()
+        root_paths=None if roots is None else tuple(Path(root).resolve() for root in roots)
+        if root_paths==():return []
         with self.connect() as c:
             query='SELECT f.*,k.signature,k.vectors,k.visual,k.thumbnail,k.fields,k.tags,k.manual_category,k.manual_fields,k.note FROM files f LEFT JOIN knowledge k ON f.path=k.path'
             params=[]
-            if roots:
+            if root_paths is not None:
                 params=[str(r) for r in root_paths]; query+=' WHERE f.scope IN ('+','.join('?' for _ in params)+')'
             query+=' ORDER BY f.mtime DESC'
             if limit is not None: query+=' LIMIT ? OFFSET ?'; params.extend([limit,offset])
@@ -235,22 +241,27 @@ class Knowledge(Library):
             out.append(r)
         return out
 
-    def stats(self,roots):
-        params=[str(Path(r).resolve()) for r in roots]
+    def stats(self,roots=None):
+        params=None if roots is None else [str(Path(r).resolve()) for r in roots]
+        if params==[]:return dict(total=0,pending=0)
         with self.connect() as c:
-            row=c.execute("SELECT COUNT(*) AS total,SUM(CASE WHEN k.vectors IS NULL OR k.vectors='[]' THEN 1 ELSE 0 END) AS pending FROM files f LEFT JOIN knowledge k ON f.path=k.path WHERE f.scope IN ("+','.join('?' for _ in params)+')',params).fetchone()
+            query="SELECT COUNT(*) AS total,SUM(CASE WHEN k.vectors IS NULL OR k.vectors='[]' THEN 1 ELSE 0 END) AS pending FROM files f LEFT JOIN knowledge k ON f.path=k.path"
+            if params is not None:query+=' WHERE f.scope IN ('+','.join('?' for _ in params)+')'
+            row=c.execute(query,params or []).fetchone()
         return dict(total=row['total'],pending=row['pending'] or 0)
 
     def smart_search(self,query,roots,previous='',similar=None,allow_model=True):
         self.ai_error=''
         q=(previous+' '+query if any(t in query for t in ('그중','그 중','거기서')) else query).strip()
+        roots=None if roots is None else tuple(Path(root).resolve() for root in roots)
         rows=self.rows(roots); exact,_=super().search(q,roots=roots)
         vision=visual_intent(q)
         object_vectors={}
         self.search_notice=''
         image_exts=getattr(self,'photo_extensions',IMAGE_EXTS)
         self.search_coverage=coverage_for(rows,image_exts)
-        self.search_coverage['roots']=[str(Path(root).resolve()) for root in roots]
+        self.search_coverage['roots']=[str(root) for root in roots or ()]
+        if roots==():return [],q
         exact_paths={r['path'] for r in exact}; tag_names=re.findall(r'#([^\s]+)',q)
         if not q and not similar:
             for r in rows: r.update(reason=r['status'],group='전체',score=1,evidence=r['body'][:180])
@@ -409,21 +420,43 @@ class Knowledge(Library):
             results.append(r)
         return sorted(results,key=lambda r:(r['group']=='일치하는 파일',r['score']),reverse=True),q
 
-    def relocate(self):
+    def relocate(self,mapping):
+        if not mapping:return
         with self.connect() as c:
-            for move in c.execute("SELECT * FROM moves WHERE state IN ('done','undone') ORDER BY created").fetchall():
-                src,dst=(move['source'],move['dest']) if move['state']=='done' else (move['dest'],move['source'])
-                if not Path(dst).exists(): continue
+            for src,dst in mapping.items():
                 c.execute('UPDATE OR IGNORE knowledge SET path=? WHERE path=?',(dst,src))
                 c.execute('UPDATE OR IGNORE tray SET path=? WHERE path=?',(dst,src))
+        from file_memory import FileMemory
+        FileMemory(self.data).remap_paths(mapping)
+        from final_versions import FinalVersions
+        FinalVersions(self.data).remap_paths(mapping)
+        if (self.data/'mail.sqlite3').is_file():
+            from mail_store import MailStore
+            MailStore(self.data).remap_paths(mapping)
     @serialized
     def move(self,*args,**kw):
-        result=super().move(*args,**kw); self.relocate()
+        # Only this call's completed moves may redirect references. Replaying the
+        # journal would steal links from a new file created at an old source path.
+        with self.connect() as c:
+            last_row=c.execute('SELECT COALESCE(MAX(rowid),0) FROM moves').fetchone()[0]
+        result=super().move(*args,**kw)
+        completed=set(result[0])
+        with self.connect() as c:
+            mapping={row['source']:row['dest'] for row in c.execute(
+                "SELECT source,dest FROM moves WHERE rowid>? AND state='done'",(last_row,))
+                if row['dest'] in completed}
+        self.relocate(mapping)
         for path in result[0]: self.reward('store:'+fingerprint(path),10,'파일을 안전하게 보관')
         return result
     @serialized
     def undo(self):
-        result=super().undo(); self.relocate(); return result
+        with self.connect() as c:
+            batch=c.execute("SELECT batch FROM moves WHERE state='done' ORDER BY created DESC LIMIT 1").fetchone()
+            moves=c.execute("SELECT source,dest FROM moves WHERE batch=? AND state='done'",(batch['batch'],)).fetchall() if batch else []
+        result=super().undo()
+        completed=set(result[0])
+        self.relocate({row['dest']:row['source'] for row in moves if row['source'] in completed})
+        return result
 
     def reward(self,event,points,label):
         # Repeat actions cannot farm rewards; points never decay.

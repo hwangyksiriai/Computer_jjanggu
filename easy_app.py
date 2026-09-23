@@ -1,7 +1,9 @@
 """Small, task-first interface. File operations still use the existing safety checks."""
 from pathlib import Path
+import os
 import sys
 import time
+import sqlite3
 import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import messagebox, filedialog, simpledialog
@@ -13,6 +15,178 @@ from photo_controller import PhotoController
 
 
 class EasyApp(PhotoController,EnhancedApp):
+    def make_library(self):
+        from file_memory import FileMemory
+        from final_versions import FinalVersions
+        self.file_memory=FileMemory(self.data)
+        self.final_versions=FinalVersions(self.data)
+        return super().make_library()
+
+    def open_file(self,path):
+        opened=super().open_file(path)
+        if opened and Path(path).suffix.lower() not in {'.exe','.lnk','.bat','.cmd','.com','.msi'}:
+            try:self.file_memory.record_open(path)
+            except (OSError,ValueError):pass
+        return opened
+
+    def copy_result_files(self,paths,parent=None):
+        """Copy real files for paste into an attachment area or Explorer."""
+        from windows_features import copy_files
+        from file_transfer import COPY_MESSAGE
+        owner=parent if parent is not None else self.root
+        try:
+            copy_files(paths,owner_hwnd=owner.winfo_toplevel().winfo_id())
+        except (OSError,ValueError,TypeError,tk.TclError) as error:
+            messagebox.showerror('파일 복사',str(error),parent=owner)
+            return False
+        self.status.set(COPY_MESSAGE)
+        return True
+
+    def show_collections(self):
+        from collections_ui import show_collections
+        return show_collections(self)
+
+    def show_smart_collections(self):
+        from smart_collections_ui import show_smart_collections
+        return show_smart_collections(self)
+
+    def refresh_smart_collections(self):
+        from smart_collections_ui import refresh_smart_collections
+        refresh_smart_collections(self)
+
+    def final_versions_changed(self):
+        for view in list(getattr(self,'result_browsers',())):
+            update=getattr(view,'final_state_changed',None)
+            if callable(update) and not getattr(view,'closed',True):update()
+
+    def get_mail_store(self):
+        from mail_store import MailStore
+        if not hasattr(self,'mail_store'):self.mail_store=MailStore(self.data)
+        return self.mail_store
+
+    def show_mail_connections(self):
+        from mail_connections_ui import show_mail_connections
+        self.get_mail_store()
+        return show_mail_connections(self)
+
+    def mail_attachments_changed(self):
+        # Only attachment directories enter the search index. Stored credentials
+        # and the original MIME messages live outside these directories.
+        managed={os.path.normcase(str(Path(p).resolve())) for p in self.settings.get('mail_document_roots',[])}
+        imported=self.get_mail_store().attachment_roots()
+        from document_locations import normalize_document_roots
+        self.document_roots()  # Apply legacy migration before reading saved, including offline locations.
+        saved=normalize_document_roots(self.settings.get('document_roots',[]),existing_only=False)
+        roots=[str(p) for p in saved if os.path.normcase(str(p)) not in managed]
+        self.settings['mail_document_roots']=list(imported)
+        self.set_document_roots(roots+list(imported))
+        self.document_locations_changed()
+        self.status.set('가져온 메일 첨부파일을 검색할 수 있도록 확인하고 있어요.')
+
+    def show_mail_attachments(self):
+        from result_browser import ResultBrowser
+        store=self.get_mail_store()
+        rows=self.reference_rows(store.attachments(limit=2000),include_missing=True)
+        view=ResultBrowser(self,rows,context_title='메일 첨부파일')
+        count=store.attachment_count()
+        view.coverage.configure(text=(f'총 {count:,}개 중 최근 2,000개예요. 찾기로 연결된 폴더 전체를 검색할 수 있어요.'
+                                     if count>2000 else '받은 메일의 사본이에요. 파일 정보에서 보낸 사람과 제목을 확인하세요.'))
+        return view
+
+    def mail_source(self,path):
+        try:return self.get_mail_store().by_attachment(path)
+        except (OSError,ValueError,sqlite3.Error):return None
+
+    def add_to_collection(self,paths):
+        from collections_ui import choose_collection
+        return choose_collection(self,paths)
+
+    def show_recent(self):
+        from result_browser import ResultBrowser
+        return ResultBrowser(self,self.reference_rows(self.file_memory.recent(20)),context_title='최근 연 파일')
+
+    def is_pinned(self,path):
+        try:return self.file_memory.is_pinned(path)
+        except (OSError,ValueError,sqlite3.Error):return False
+
+    def toggle_pinned(self,path,parent=None):
+        try:
+            enabled=self.file_memory.set_pinned(path,not self.file_memory.is_pinned(path))
+        except (OSError,ValueError,sqlite3.Error) as error:
+            messagebox.showerror('파일 고정',str(error),parent=parent or self.root)
+            return None
+        self.status.set('고정했어요. 처음 화면에서 바로 열 수 있어요.' if enabled else '고정을 해제했어요. 원본 파일은 그대로예요.')
+        self.pinned_files_changed()
+        return enabled
+
+    def pinned_result_rows(self):
+        return self.reference_rows(self.file_memory.pinned_files(),include_missing=True)
+
+    def show_pinned(self):
+        from result_browser import ResultBrowser
+        view=getattr(self,'pinned_view',None)
+        if view is not None and not view.closed and view.pinned_view:
+            view.pin_state_changed();view.win.deiconify();view.win.lift()
+        else:
+            view=self.pinned_view=ResultBrowser(self,self.pinned_result_rows(),context_title='고정한 파일',pinned_view=True)
+        return view
+
+    def pinned_files_changed(self):
+        for view in list(getattr(self,'result_browsers',())):
+            update=getattr(view,'pin_state_changed',None)
+            if callable(update) and not view.closed:update()
+        bubble=getattr(self,'bubble',None)
+        if bubble and bubble.alive():
+            if getattr(bubble,'_showing_home',False):bubble.show_home(reset=False)
+            else:bubble.refresh_pins()
+        for path,widget in getattr(self,'main_pin_buttons',()):
+            if widget.winfo_exists():widget.configure(text='★' if self.is_pinned(path) else '☆')
+
+    def reference_rows(self,references,include_missing=False):
+        rows=[]
+        with self.library.connect() as connection:
+            for reference in references:
+                row=dict(reference,group='일치하는 파일',body='',reason='내가 열거나 모음에 담은 파일이에요.')
+                try:stat=Path(row['path']).stat()
+                except OSError:
+                    if include_missing:
+                        row.update(available=False,reason='파일이 이동되었거나 삭제됐어요.')
+                        rows.append(row)
+                    continue
+                cached=connection.execute('SELECT body,category,mtime,size FROM files WHERE path=?',(row['path'],)).fetchone()
+                if cached and cached['mtime']==stat.st_mtime and cached['size']==stat.st_size:
+                    row.update(body=cached['body'] or '',category=cached['category'])
+                row.update(mtime=stat.st_mtime,size=stat.st_size)
+                rows.append(row)
+        return rows
+
+    def compare_file(self,row,visible_rows=()):
+        from file_comparison import version_candidates
+        from file_compare_ui import show_comparison
+        # Open immediately using this result snapshot. Other files can be picked
+        # inside the comparison window without scanning the catalogue on Tk.
+        candidates=version_candidates(row,visible_rows)
+        return show_comparison(self,row,candidates)
+
+    def is_demo_search(self):
+        return self.demo.resolve() in self.document_roots()
+
+    def choose_document_locations(self):
+        from document_locations_ui import show_locations
+        return show_locations(self)
+
+    def document_locations_changed(self):
+        self.bubble_refinement=None
+        self.refresh_smart_collections()
+        if self.bubble and self.bubble.alive():
+            self.bubble.refinement=None;self.bubble.rows=[];self.bubble.pending=False
+            self.bubble.show_home()
+        for browser in list(getattr(self,'result_browsers',())):
+            if not getattr(browser,'closed',True) and not browser.context_title:
+                browser.update_results([],browser.search_query)
+                browser.coverage.configure(text='새로 연결한 폴더를 확인하고 있어요.')
+        if self.page=='home':self.show('home')
+
     def save_search_state(self,mode,coverage,count,error=None):
         """Latest diagnostic snapshot only; no file contents or result names."""
         import json
@@ -53,16 +227,7 @@ class EasyApp(PhotoController,EnhancedApp):
         self.bubble=QuickBubble(self)
 
     def connect_from_bubble(self):
-        hidden=self.root.state()=='withdrawn'
-        self.root.pet_only_start=hidden
-        try: self.choose_source(True)
-        finally:
-            self.root.pet_only_start=False
-            if hidden: self.root.withdraw()
-        if self.bubble and self.bubble.alive():
-            self.bubble.message.set('연결했어! 이제 기억나는 단어로 찾아봐.' if self.settings['source'] else '연습용 파일에서 먼저 찾아봐!')
-            if self.settings['source']:
-                self.bubble.clear(); self.bubble.resize(round(185*self.bubble.text_scale))
+        return self.choose_document_locations()
 
     def voice_settings(self):
         from voice_setup_ui import show
@@ -152,12 +317,12 @@ class EasyApp(PhotoController,EnhancedApp):
     def page_help(self):
         from diagnostics import inspect_environment
         label(self.content,'처음부터 같이 해봐요',22,bold=True).pack(anchor='w',pady=(0,14))
-        for text,action in [('1. 찾을 폴더 연결',lambda:self.choose_source(False)),
+        for text,action in [('1. 찾을 폴더 연결',self.choose_document_locations),
                             ('2. 연습용 급여명세서 찾아보기',self.practice_search),
                             ('3. 이름·위치 몰라도 사진 찾기',lambda:self.quick('사진 보여줘')),
                             ('4. 짱구 목소리 설정',self.voice_settings)]:
             button(self.content,text,action).pack(fill='x',pady=5)
-        label(self.content,'문서는 연결한 폴더와 보관함에서 찾아요. 사진은 바탕화면·다운로드·사진·문서 폴더를 함께 확인해요.\n사진 모음에서 찾을 폴더를 더 추가할 수 있어요. 파일은 PC 안에서 읽어요.\n정리는 이동할 목록을 확인한 다음 실행하며 되돌릴 수 있어요.',12,GREEN,wraplength=480,justify='left').pack(anchor='w',pady=18)
+        label(self.content,'문서는 “찾을 폴더”에서 선택한 곳을 함께 찾아요. 검색 위치와 정리 위치는 따로 설정해요.\n최근 파일에는 짱구로 연 파일이 나와요. 내 모음에 담아도 원래 파일은 그대로 있어요.\n사진 모음에서 사진을 찾을 폴더도 추가할 수 있어요. 정리는 목록을 확인한 다음 실행하며 되돌릴 수 있어요.',12,GREEN,wraplength=480,justify='left').pack(anchor='w',pady=18)
         checks=inspect_environment(self.data)
         for item in checks:
             label(self.content,('✓ ' if item['ok'] else '확인: ')+item['message'],12,GREEN if item['ok'] else ORANGE,wraplength=480,justify='left').pack(anchor='w',pady=5)
@@ -177,7 +342,7 @@ class EasyApp(PhotoController,EnhancedApp):
         path.write_text('연습용 급여명세서\n기본급 3000000원\n공제합계 200000원\n실수령액 2800000원',encoding='utf-8')
         library=Knowledge(self.data/'practice-index');library.index([self.demo])
         rows,_=library.smart_search('급여명세서 찾아줘',[self.demo])
-        browser=ResultBrowser(self,rows);browser.search_query='연습'
+        browser=ResultBrowser(self,rows);browser.search_query='연습';browser.query.set('급여명세서')
         browser.win.title('연습 · 이름 없는 급여명세서 찾기')
         browser.update_coverage(dict(library.search_coverage,roots=['연습용 폴더 · 내 파일과 별개']))
 
@@ -195,15 +360,11 @@ class EasyApp(PhotoController,EnhancedApp):
         label(self.content, '어떤 파일을 찾으세요?', 25, bold=True).pack(anchor='w', pady=(0, 10))
         label(self.content, '이름을 몰라도 괜찮아요. 문서 내용이나 사진 속 모습을 말해 주세요.', 13, GREEN).pack(anchor='w')
         panel = tk.Frame(self.content, bg='#FFF0DF'); panel.pack(fill='x', pady=16)
-        if not self.settings['source']:
-            label(panel, '문서 검색은 아직 연습용이에요.', 14, bold=True).pack(anchor='w', padx=16, pady=(14, 4))
-            label(panel, '내 문서는 폴더를 연결해 주세요. 사진은 아래에서 바로 찾아볼 수 있어요.', 12,wraplength=620).pack(anchor='w', padx=16)
-            button(panel, '내 바탕화면 연결하기', lambda: self.choose_source(True), primary=True).pack(anchor='w', padx=16, pady=12)
-        else:
-            label(panel, '문서 찾는 곳: ' + str(self.source), 12, bold=True,wraplength=620,justify='left').pack(anchor='w', padx=16, pady=(12,4))
-            line=tk.Frame(panel,bg='#FFF0DF'); line.pack(fill='x',padx=16,pady=(0,10))
-            label(line,'보관함도 함께 찾아요. 다른 폴더는 연결해야 검색해요.',10,GREEN).pack(side='left')
-            button(line,'찾을 폴더 바꾸기',lambda:self.choose_source(False)).pack(side='right')
+        from result_browser import folder_name
+        roots=self.document_roots()
+        scope='내 문서를 찾을 폴더를 연결해 주세요.' if self.is_demo_search() or not roots else '찾는 곳: '+' · '.join(folder_name(p) for p in roots[:2])+(' 외' if len(roots)>2 else '')
+        button(panel,'찾을 폴더',self.choose_document_locations).pack(side='right',padx=10,pady=10)
+        label(panel,scope,12,GREEN,wraplength=440,justify='left').pack(side='left',padx=16,pady=14)
         search = tk.Frame(self.content, bg=WHITE); search.pack(fill='x', pady=(0, 8))
         self.entry = tk.Entry(search, textvariable=self.query, font=(FONT, 16), relief='flat')
         self.entry.pack(side='left', fill='x', expand=True, padx=12, ipady=14)
@@ -214,6 +375,9 @@ class EasyApp(PhotoController,EnhancedApp):
             return self.search_ime.commit_then(action) if self.search_ime else action()
         self.entry.bind('<Return>', lambda e: submit())
         button(search, '찾기', submit, primary=True).pack(side='right', padx=6, pady=6)
+        shortcuts=tk.Frame(self.content,bg=BG);shortcuts.pack(fill='x')
+        button(shortcuts,'내 모음',self.show_collections).pack(side='left')
+        button(shortcuts,'최근 연 파일',self.show_recent).pack(side='left',padx=6)
         examples = tk.Frame(self.content, bg=BG); examples.pack(fill='x', pady=8)
         for text in ['급여명세서 찾아줘', '사진 보여줘', '전반적으로 파란 사진에 의자가 있어 찾아줘']:
             button(examples, text, lambda t=text: self.quick(t)).pack(anchor='w',pady=3)
@@ -235,21 +399,22 @@ class EasyApp(PhotoController,EnhancedApp):
         if self.page != 'home':
             return
         for child in self.results.winfo_children(): child.destroy()
+        self.main_pin_buttons=[]
         if self.query.get().strip():
             total = len(self.result_cache)
             rows = self.result_cache[self.search_offset:self.search_offset+30]
         else:
-            total = self.library.stats([self.source, self.vault])['total']
-            rows = self.library.rows([self.source, self.vault], limit=30, offset=self.search_offset)
+            total = self.document_stats()['total']
+            rows = self.document_rows(limit=30, offset=self.search_offset)
         self.last_count = total
-        mode = '내 PC 사진' if self.is_photo_search else ('연습용 파일' if not self.settings['source'] else self.source.name)
+        mode = '내 PC 사진' if self.is_photo_search else ('연습용 파일' if self.is_demo_search() else '연결한 폴더')
         self.result_count.configure(text=f'{mode} · {total}개')
         self.coverage_label.configure(text=self.photo_summary() if self.is_photo_search else coverage_text(getattr(self.library,'search_coverage',{})))
         if not rows:
             label(self.results, '현재 확인한 파일에서는 찾지 못했어요.\n찾을 폴더와 분석 상태를 확인해 주세요.',
                   13, GREEN, justify='left').pack(anchor='w', pady=20)
             actions=tk.Frame(self.results,bg=BG); actions.pack(anchor='w')
-            button(actions,'다른 폴더 찾기',self.choose_photo_folder if self.is_photo_search else lambda:self.choose_source(False)).pack(side='left',padx=(0,8))
+            button(actions,'찾을 폴더',self.choose_photo_folder if self.is_photo_search else self.choose_document_locations).pack(side='left',padx=(0,8))
             button(actions,'분석 이어하기',self.resume_photo_analysis if self.is_photo_search else self.reindex).pack(side='left')
         for row in rows:
             card = tk.Frame(self.results, bg=WHITE); card.pack(fill='x', pady=5)
@@ -265,8 +430,16 @@ class EasyApp(PhotoController,EnhancedApp):
             actions = tk.Frame(card, bg=WHITE); actions.pack(side='right', padx=8, pady=12)
             button(actions, '열기', lambda r=row: self.open_file(r['path']), primary=True).pack(side='left', padx=4)
             button(actions, '미리보기', lambda r=row: self.preview(r)).pack(side='left')
+            button(actions, '복사', lambda p=row['path']: self.copy_result_files([p])).pack(side='left')
             info = tk.Frame(card, bg=WHITE); info.pack(side='left', fill='both', expand=True, padx=14, pady=12)
-            label(info, row['name'], 13, bold=True, wraplength=360, justify='left', anchor='w').pack(fill='x')
+            title_row=tk.Frame(info,bg=WHITE);title_row.pack(fill='x')
+            pin=tk.Button(title_row,text='★' if self.is_pinned(row['path']) else '☆',
+                command=lambda p=row['path']:self.toggle_pinned(p),font=(FONT,16),bg=WHITE,fg=GREEN,bd=0,padx=7,cursor='hand2')
+            pin.pack(side='right');self.main_pin_buttons.append((row['path'],pin))
+            name=label(title_row, row['name'], 13, bold=True, wraplength=310, justify='left', anchor='w')
+            name.pack(fill='x')
+            from file_transfer import bind_file_drag
+            bind_file_drag(name,lambda p=row['path']:[p],self.status.set)
             label(info, Path(row['path']).parent.name, 11, GREEN, anchor='w').pack(fill='x', pady=(4, 0))
             if row.get('reason'):
                 label(info,row['reason'],10,GREEN,wraplength=330,justify='left',anchor='w').pack(fill='x',pady=4)
@@ -279,6 +452,14 @@ class EasyApp(PhotoController,EnhancedApp):
 
     def refresh_index_results(self):
         if self.restarting or self.busy:return
+        self.pinned_files_changed()
+        self.final_versions_changed()
+        self.refresh_smart_collections()
+        for name in ('photo_gallery','saved_photo_gallery'):
+            gallery=getattr(self,name,None)
+            if gallery is not None and not gallery._closed:gallery.reload_saved()
+        if self.bubble and self.bubble.alive() and not self.bubble.pending and self.bubble.refinement is None:
+            self.bubble.show_home()
         query=self.query.get().strip()
         from reactions import quick_intent
         if query and query==self.last_submitted and quick_intent(query) not in {'CLEAN','CLOSET','DANCE','QUIET','ROOM','TRAY','LAUNCHER'}:
@@ -286,6 +467,7 @@ class EasyApp(PhotoController,EnhancedApp):
         elif not query and self.page=='home':self.render_results()
 
     def do_search(self, speak=True, reply_surface=None, refresh=False):
+        if reply_surface is not None and not reply_surface.alive():reply_surface=None
         query = self.query.get().strip()
         from visual_query import visual_intent
         from photo_query import is_photo_followup
@@ -308,7 +490,7 @@ class EasyApp(PhotoController,EnhancedApp):
         if not refresh:self.search_offset = 0
         if not query:
             self.result_cache = []; self.last_submitted = ''; self.render_results(); return
-        source, vault = self.source, self.vault
+        roots = self.document_roots()
         context=self.query_context if reply_surface is not None and reply_surface.refining else ''
         within={r['path'] for r in reply_surface.rows} if reply_surface is not None and reply_surface.refining else None
         search_query=self.query_context if refresh and query==self.last_submitted else query
@@ -318,19 +500,23 @@ class EasyApp(PhotoController,EnhancedApp):
         if speak:self.pet_event('돋보기 들고 찾아볼게!',2,speak=True,explicit=True)
         def work():
             try:
-                rows,resolved=self.library.smart_search(search_query,[source,vault],context)
+                rows,resolved=self.search_documents(search_query,context,roots=roots)
                 if within is not None:rows=[r for r in rows if r['path'] in within]
                 return rows,resolved
             except Exception:
                 self.events.put(lambda:self.search_fx.update(active=False,outcome='error',until=0))
                 raise
         def finish(result):
+            if roots!=self.document_roots():
+                self.search_fx.update(active=False)
+                self.root.after_idle(lambda:self.do_search(False,reply_surface=reply_surface,refresh=True))
+                return
             self.result_cache, self.query_context = result
             self.result_cache=[row for row in self.result_cache if row['path'] not in getattr(self,'photo_removed',set())]
             self.last_submitted = query
             notice=getattr(self.library,'search_notice','')
             if self.library.ai_error:notice='AI 분석에 문제가 있어 지금은 읽은 본문 결과만 보여요. 다시 분석을 눌러 주세요.'
-            self.last_reply=summary(len(self.result_cache),getattr(self.library,'search_coverage',{}),notice,self.indexing,not self.settings['source'])
+            self.last_reply=summary(len(self.result_cache),getattr(self.library,'search_coverage',{}),notice,self.indexing,self.is_demo_search())
             self.save_search_state('documents',self.library.search_coverage,len(self.result_cache),self.library.ai_error)
             self.status.set(self.last_reply)
             self.search_fx.update(active=False,outcome='found' if self.result_cache else 'empty',until=time.monotonic()+3)
@@ -340,7 +526,7 @@ class EasyApp(PhotoController,EnhancedApp):
             for browser in list(getattr(self,'result_browsers',())):
                 browser.update_results(self.result_cache,query)
             if speak:
-                self.pet_event(f'{len(self.result_cache)}개 후보를 찾았어. 미리보기로 확인해 봐!' if self.result_cache else '지금 확인한 파일에서는 못 찾았어. 찾는 곳부터 확인해 볼까?',2 if self.result_cache else 1,speak=True,explicit=True)
+                self.pet_event(f'후보 파일 {len(self.result_cache)}개를 찾았어. 미리보기로 확인해 봐!' if self.result_cache else '지금 확인한 파일에서는 못 찾았어. 찾는 곳부터 확인해 볼까?',2 if self.result_cache else 1,speak=True,explicit=True)
                 self.pet.action=2 if self.result_cache else 0; self.pet.action_until=time.time()+1.5
             if self.page == 'home':
                 self.render_results(); self.reply_label.configure(text=self.last_reply)
@@ -371,6 +557,8 @@ class EasyApp(PhotoController,EnhancedApp):
 
     def page_more(self):
         label(self.content, '필요할 때만 꺼내 쓰세요.', 24, bold=True).pack(anchor='w', pady=(0, 20))
+        button(self.content,'내 모음',self.show_collections).pack(fill='x',pady=7)
+        button(self.content,'메일 첨부파일 연결',self.show_mail_connections).pack(fill='x',pady=7)
         for key, title in [('closet', '짱구 꾸미기'), ('room', '우리 방'), ('tray', '모아 둔 파일'),
                            ('collection', '성장과 보상'), ('tools', '추가 기능과 설정')]:
             button(self.content, title, lambda k=key: self.show(k)).pack(fill='x', pady=7)

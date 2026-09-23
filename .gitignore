@@ -14,3 +14,10 @@ venv/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+voice-python/
+voice-env/
+qwen-packages/
+qwen3-tts-base*/
+pip-cache/
+voice-temp/
+python-*-embed-amd64.zip

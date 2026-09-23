@@ -3,6 +3,7 @@ import ctypes
 from ctypes import wintypes
 import os
 from pathlib import Path
+import struct
 import threading
 
 class Hotkey:
@@ -46,26 +47,103 @@ def foreground_focus_reason(own_hwnds):
             return '전체화면 감지'
     return ''
 
-def copy_files(paths):
-    paths=[str(Path(p).resolve()) for p in paths if Path(p).exists()]
-    if not paths: raise ValueError('복사할 파일이 없어요.')
-    class DROPFILES(ctypes.Structure):
-        _fields_=[('pFiles',wintypes.DWORD),('pt',wintypes.POINT),('fNC',wintypes.BOOL),('fWide',wintypes.BOOL)]
-    header=DROPFILES(); header.pFiles=ctypes.sizeof(header); header.fWide=True
-    payload=bytes(header)+('\0'.join(paths)+'\0\0').encode('utf-16-le')
-    k=ctypes.windll.kernel32; u=ctypes.windll.user32
-    k.GlobalAlloc.argtypes=[wintypes.UINT,ctypes.c_size_t]; k.GlobalAlloc.restype=wintypes.HGLOBAL
-    k.GlobalLock.argtypes=[wintypes.HGLOBAL]; k.GlobalLock.restype=ctypes.c_void_p
-    k.GlobalUnlock.argtypes=[wintypes.HGLOBAL]; k.GlobalFree.argtypes=[wintypes.HGLOBAL]
-    u.SetClipboardData.argtypes=[wintypes.UINT,wintypes.HANDLE]; u.SetClipboardData.restype=wintypes.HANDLE
-    handle=k.GlobalAlloc(0x0042,len(payload)); pointer=k.GlobalLock(handle)
-    if not pointer: raise OSError('클립보드 메모리를 준비하지 못했어요.')
-    ctypes.memmove(pointer,payload,len(payload)); k.GlobalUnlock(handle)
-    if not u.OpenClipboard(None): k.GlobalFree(handle); raise OSError('클립보드를 다른 앱이 사용 중이에요.')
+def _clipboard_api():
+    """Private DLL instances keep pointer-sized signatures separate from hotkeys."""
+    if os.name!='nt':raise OSError('파일 복사는 Windows에서 사용할 수 있어요.')
+    k=ctypes.WinDLL('kernel32',use_last_error=True)
+    u=ctypes.WinDLL('user32',use_last_error=True)
+    signatures=(
+        (k,'GlobalAlloc',[wintypes.UINT,ctypes.c_size_t],wintypes.HGLOBAL),
+        (k,'GlobalLock',[wintypes.HGLOBAL],ctypes.c_void_p),
+        (k,'GlobalUnlock',[wintypes.HGLOBAL],wintypes.BOOL),
+        (k,'GlobalFree',[wintypes.HGLOBAL],wintypes.HGLOBAL),
+        (k,'GetModuleHandleW',[wintypes.LPCWSTR],wintypes.HMODULE),
+        (u,'RegisterClipboardFormatW',[wintypes.LPCWSTR],wintypes.UINT),
+        (u,'IsWindow',[wintypes.HWND],wintypes.BOOL),
+        (u,'OpenClipboard',[wintypes.HWND],wintypes.BOOL),
+        (u,'EmptyClipboard',[],wintypes.BOOL),
+        (u,'SetClipboardData',[wintypes.UINT,wintypes.HANDLE],wintypes.HANDLE),
+        (u,'CloseClipboard',[],wintypes.BOOL),
+        (u,'CreateWindowExW',[wintypes.DWORD,wintypes.LPCWSTR,wintypes.LPCWSTR,wintypes.DWORD,
+            ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,wintypes.HWND,wintypes.HMENU,
+            wintypes.HINSTANCE,ctypes.c_void_p],wintypes.HWND),
+        (u,'DestroyWindow',[wintypes.HWND],wintypes.BOOL),
+    )
+    for dll,name,args,result in signatures:
+        function=getattr(dll,name);function.argtypes=args;function.restype=result
+    return k,u
+
+
+def _clipboard_memory(kernel,payload):
+    handle=kernel.GlobalAlloc(0x0042,len(payload))  # GMEM_MOVEABLE | GMEM_ZEROINIT
+    if not handle:raise OSError('클립보드 메모리를 준비하지 못했어요.')
     try:
-        u.EmptyClipboard()
-        if not u.SetClipboardData(15,handle): k.GlobalFree(handle); raise OSError('파일 복사에 실패했어요.')
-    finally: u.CloseClipboard()
+        pointer=kernel.GlobalLock(handle)
+        if not pointer:raise OSError('클립보드 메모리를 열지 못했어요.')
+        try:ctypes.memmove(pointer,payload,len(payload))
+        finally:
+            ctypes.set_last_error(0)
+            unlocked=kernel.GlobalUnlock(handle)
+            # GlobalUnlock returns zero on success when its last lock is gone.
+            if not unlocked and ctypes.get_last_error():
+                raise OSError('클립보드 메모리를 닫지 못했어요.')
+    except BaseException:
+        kernel.GlobalFree(handle)
+        raise
+    return handle
+
+
+def copy_files(paths,owner_hwnd=None):
+    """Publish file references with COPY intent, without touching originals.
+
+    All requested files must exist. Allocation and validation precede changing
+    the clipboard; its previous contents are never read. A successful call
+    returns the absolute, deduplicated paths. The optional owner is a live HWND.
+    Legacy callers use a hidden message-only window on the calling thread.
+
+    Win32 contracts: learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setclipboarddata
+    and learn.microsoft.com/windows/win32/shell/clipboard.
+    """
+    from file_transfer import validate_file_paths
+    paths=validate_file_paths(paths)
+    # DROPFILES is five 32-bit fields on both 32-bit and 64-bit Windows.
+    payload=struct.pack('<IiiII',20,0,0,0,1)+('\0'.join(paths)+'\0\0').encode('utf-16-le')
+    k,u=_clipboard_api()
+    pending=[];hidden=None;opened=False;close_ok=True
+    try:
+        effect=u.RegisterClipboardFormatW('Preferred DropEffect')
+        if not effect:raise OSError('파일 복사 형식을 준비하지 못했어요.')
+        copy_handle=_clipboard_memory(k,struct.pack('<I',1))  # DROPEFFECT_COPY
+        pending.append(copy_handle)
+        files_handle=_clipboard_memory(k,payload)
+        pending.append(files_handle)
+        if owner_hwnd is None:
+            hidden=u.CreateWindowExW(0,'STATIC','Jjanggu file clipboard',0,0,0,0,0,
+                                     wintypes.HWND(-3),None,k.GetModuleHandleW(None),None)
+            if not hidden:raise OSError('파일 복사를 준비하지 못했어요. 다시 시도해 주세요.')
+            owner=hidden
+        else:
+            owner=getattr(owner_hwnd,'value',owner_hwnd)
+            if not isinstance(owner,int) or isinstance(owner,bool) or owner<=0 or not u.IsWindow(owner):
+                raise ValueError('복사할 창이 닫혔어요. 파일을 다시 선택해 주세요.')
+        # A file may disappear while native memory/window preparation runs.
+        validate_file_paths(paths)
+        if not u.OpenClipboard(owner):raise OSError('다른 앱이 클립보드를 사용 중이에요. 다시 복사해 주세요.')
+        opened=True
+        if not u.EmptyClipboard():raise OSError('클립보드를 준비하지 못했어요. 다시 복사해 주세요.')
+        # Publish intent first: a failed second format must not leave usable
+        # file references with an unspecified move/copy operation.
+        for format_id,handle in ((effect,copy_handle),(15,files_handle)):
+            if not u.SetClipboardData(format_id,handle):
+                u.EmptyClipboard()  # OS releases any already-transferred handle.
+                raise OSError('파일 복사를 마치지 못했어요. 다시 복사해 주세요.')
+            pending.remove(handle)  # From now on only Windows may free it.
+    finally:
+        if opened:close_ok=bool(u.CloseClipboard())
+        for handle in pending:k.GlobalFree(handle)
+        if hidden:u.DestroyWindow(hidden)
+    if not close_ok:raise OSError('클립보드를 닫지 못했어요. 다시 복사해 주세요.')
+    return paths
 
 def get_wallpaper():
     buffer=ctypes.create_unicode_buffer(32768)

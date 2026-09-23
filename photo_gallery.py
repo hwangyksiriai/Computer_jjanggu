@@ -3,7 +3,9 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+import os
 import queue
+import stat
 import tkinter as tk
 from tkinter import ttk, messagebox
 import weakref
@@ -19,6 +21,44 @@ INK = '#292C3E'
 ACCENT = '#6651BD'
 MUTED = '#666878'
 BORDER = '#E6E1D9'
+
+
+def _path_key(path):
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _saved_problem(row):
+    """Check a saved reference without substituting a cached/renamed picture."""
+    if not row.get('_saved_reference'):
+        return ''
+    if row.get('available') is False:
+        return row.get('unavailable_reason') or '파일이 없거나 읽을 수 없어요'
+    if row.get('status') == 'PC에 내려받지 않은 사진':
+        return 'PC에 내려받지 않은 사진이에요'
+    try:
+        current = Path(row['path']).stat()
+        if not stat.S_ISREG(current.st_mode):
+            return '파일이 없거나 읽을 수 없어요'
+        if getattr(current, 'st_file_attributes', 0) & (0x1000 | 0x400000):
+            return 'PC에 내려받지 않은 사진이에요'
+        for saved, attribute in (('saved_mtime_ns', 'st_mtime_ns'), ('saved_size', 'st_size'),
+                                 ('saved_ino', 'st_ino'), ('saved_dev', 'st_dev')):
+            if saved in row and row[saved] != getattr(current, attribute):
+                return '원본이 바뀌었어요'
+    except (OSError, ValueError, KeyError):
+        return '파일이 없거나 읽을 수 없어요'
+    return ''
+
+
+def _decode_saved(row, size):
+    problem = _saved_problem(row)
+    if problem:
+        return None, problem
+    # Saved thumbnails may outlive their original. Decode only the original,
+    # and reject a replacement/deletion while decoding was in progress.
+    picture = _decode(row['path'], size)
+    problem = _saved_problem(row)
+    return (None, problem) if problem else (picture, '')
 
 
 def _button(parent, text, command, primary=False, **kwargs):
@@ -37,6 +77,10 @@ def _short(value, length=27):
 
 
 def _badge(row):
+    if row.get('_saved_reference') and row.get('available') is False:
+        return '원본 확인 필요', '#FAE8DA', '#864723'
+    if row.get('_saved_reference'):
+        return '찜한 사진', '#ECE8F8', '#59449D'
     if row.get('status') == 'PC에 내려받지 않은 사진':
         return '다운로드 필요', '#FAE8DA', '#864723'
     if (row.get('fields') or {}).get('photo_error'):
@@ -69,6 +113,8 @@ def _date(row):
 
 
 def _reason(row):
+    if row.get('_saved_reference') and row.get('available') is False:
+        return (row.get('unavailable_reason') or '파일이 없거나 읽을 수 없어요') + ' · 찜을 해제할 수 있어요.'
     if row.get('status') == 'PC에 내려받지 않은 사진':
         return 'PC에 내려받지 않은 사진 · 저장된 폴더에서 다운로드한 뒤 다시 분석해 주세요.'
     if (row.get('fields') or {}).get('photo_error'):
@@ -76,6 +122,8 @@ def _reason(row):
     reason = row.get('reason', '').strip()
     if reason:
         return reason
+    if row.get('_saved_reference'):
+        return '직접 찜한 사진이에요.'
     return '사진 모습 분석 전 · 직접 보면서 고를 수 있어요.' if not _analyzed(row) else '사진 후보 · 원하던 모습인지 확인해 주세요.'
 
 
@@ -106,8 +154,9 @@ def _decode_sources(sources, size):
 
 
 class PhotoGallery:
-    def __init__(self, app, rows, query=None):
+    def __init__(self, app, rows, query=None, *, saved_context=False):
         self.app = app
+        self.saved_context = saved_context
         self.rows = _photo_rows(rows)
         self.search_query = getattr(app, 'last_submitted', '') if query is None else query
         self.visible = []
@@ -145,8 +194,8 @@ class PhotoGallery:
         self.win.bind('<Destroy>', self._destroyed, add='+')
         self.win.bind('<Escape>', lambda event: self.close())
 
-        self.saved_only = tk.BooleanVar(value=False)
-        self.card_size = tk.StringVar(value='편하게')
+        self.saved_only = tk.BooleanVar(master=self.win, value=saved_context)
+        self.card_size = tk.StringVar(master=self.win, value='편하게')
         header = tk.Frame(self.win, bg=BG, padx=20, pady=12)
         header.pack(fill='x')
         self.header = header
@@ -172,10 +221,10 @@ class PhotoGallery:
         self.request.pack(fill='x', pady=(3, 10))
 
         self.refine_box = tk.Frame(header, bg='#F0ECFA', padx=12, pady=10)
-        if callable(getattr(app, 'refine_photo', None)):
+        if not saved_context and callable(getattr(app, 'refine_photo', None)):
             self.refine_box.pack(fill='x')
             self.refine_box.columnconfigure(0, weight=1)
-            self.refine_query = tk.StringVar()
+            self.refine_query = tk.StringVar(master=self.win)
             from ime_entry import attach
             self.refine_entry = ttk.Entry(self.refine_box, textvariable=self.refine_query, font=('맑은 고딕', 12))
             self.refine_entry.grid(row=0, column=0, sticky='ew', ipady=7)
@@ -199,7 +248,7 @@ class PhotoGallery:
         filters.pack(fill='x')
         filters.columnconfigure(1, weight=1)
         tk.Label(filters, text='이름·폴더 속 단어', bg='white', fg=MUTED).grid(row=0, column=0, sticky='w')
-        self.query = tk.StringVar()
+        self.query = tk.StringVar(master=self.win)
         self.entry = ttk.Entry(filters, textvariable=self.query)
         self.entry.grid(row=0, column=1, sticky='ew', padx=7, ipady=4)
         from ime_entry import attach
@@ -208,7 +257,7 @@ class PhotoGallery:
         _button(filters, '적용', lambda: self._commit(self.ime, self.refresh)).grid(row=0, column=2)
         tools = tk.Frame(self.filter_section, bg='white')
         tools.pack(fill='x', pady=(7, 0))
-        self.mode = tk.StringVar(value='모든 사진')
+        self.mode = tk.StringVar(master=self.win, value='모든 사진')
         mode = ttk.Combobox(tools, state='readonly', textvariable=self.mode,
                            values=('모든 사진', '모습 분석 완료', '모습 분석 대기'), width=16)
         mode.pack(side='left')
@@ -230,10 +279,11 @@ class PhotoGallery:
         toolbar = tk.Frame(self.win, bg=BG, padx=20, pady=5)
         toolbar.pack(fill='x')
         self.all_button = _button(toolbar, '찾은 사진', lambda: self.show_saved(False))
-        self.all_button.pack(side='left')
+        if not saved_context:
+            self.all_button.pack(side='left')
         self.saved_button = _button(toolbar, '♡ 찜한 사진 0', lambda: self.show_saved(True))
         self.saved_button.pack(side='left', padx=(6, 10))
-        self.sort = tk.StringVar(value='관련도 순')
+        self.sort = tk.StringVar(master=self.win, value='관련도 순')
         sort = ttk.Combobox(toolbar, state='readonly', textvariable=self.sort,
                            values=('관련도 순', '최근 수정 순', '이름 순'), width=11)
         sort.pack(side='right', padx=(7, 0))
@@ -328,10 +378,12 @@ class PhotoGallery:
                  bg='white', fg=MUTED, justify='left', wraplength=280, font=('맑은 고딕', 9)).pack(fill='x', pady=(16, 0))
         self.detail.bind('<Configure>', self._resize_detail, add='+')
         self.win.bind('<Configure>', self._resize_window, add='+')
+        self.reload_saved(refresh=False)
         self.update_coverage(getattr(getattr(app, 'photo_library', getattr(app, 'active_library', getattr(app, 'library', None))), 'search_coverage', {}))
         self.refresh()
         self.apply_readability()
         self._poll_id = self.win.after(40, self._drain)
+        self.win.bind('<FocusIn>', self._focused, add='+')
 
     @staticmethod
     def _commit(ime, callback):
@@ -351,6 +403,10 @@ class PhotoGallery:
 
     def update_coverage(self, coverage):
         self._coverage_data = coverage
+        if self.saved_context:
+            self.coverage.configure(text='찜한 사진은 다음에도 여기에서 볼 수 있어요. 원본은 저장된 위치에 그대로 있어요.')
+            self.request.configure(text='♥ 찜한 사진')
+            return
         roots = coverage.get('roots', [])
         scope = '찾는 위치: ' + ' · '.join(Path(root).name or root for root in roots) if roots else '현재 연결한 폴더에서 찾은 사진이에요.'
         count = coverage.get('images', len(self.rows))
@@ -382,16 +438,14 @@ class PhotoGallery:
         self.coverage.configure(text=message)
 
     def update_results(self, rows, query):
-        if self._closed or query != self.search_query:
+        if self._closed or self.saved_context or query != self.search_query:
             return
         self.update_coverage(getattr(getattr(self.app, 'photo_library', getattr(self.app, 'active_library', getattr(self.app, 'library', None))), 'search_coverage', {}))
         photos = [row for row in _photo_rows(rows) if row['path'] not in self._removed_paths]
         if self.rows == photos:
             return
         self.rows = photos
-        for row in photos:
-            if row['path'] in self.saved:
-                self.saved[row['path']] = row
+        # Searching again must never replace a saved photo's original identity.
         self.refresh(preserve_view=True)
 
     def reset(self):
@@ -476,25 +530,102 @@ class PhotoGallery:
         self._show_selected()
 
     def show_saved(self, value=None):
-        self.saved_only.set(not self.saved_only.get() if value is None else value)
+        if self._closed:
+            return
+        self.saved_only.set(True if self.saved_context else not self.saved_only.get() if value is None else value)
+        if self.saved_only.get():
+            self.reload_saved(refresh=False)
         self.query.set('')
         self.mode.set('모든 사진')
         self.refresh()
 
-    def toggle_saved(self, path):
+    def _saved_path(self, path):
         if not path:
+            return None
+        key = _path_key(path)
+        return next((saved for saved in self.saved if _path_key(saved) == key), None)
+
+    def reload_saved(self, refresh=True):
+        """Read persisted references after reopening, own moves/undo or updates."""
+        if self._closed:
+            return False
+        memory = getattr(self.app, 'file_memory', None)
+        try:
+            if memory is not None:
+                rows = memory.saved_photos(include_missing=True)
+            else:
+                # Lightweight test/stub apps can still share a session store.
+                rows = list(getattr(self.app, '_photo_saved_fallback', {}).values())
+            saved = OrderedDict((row['path'], dict(row, _saved_reference=True)) for row in _photo_rows(rows))
+        except Exception:
+            messagebox.showerror('찜한 사진을 불러오지 못했어요',
+                                 '저장 목록을 읽지 못했어요. 잠시 뒤 다시 열어 주세요.', parent=self.win)
+            return False
+        changed = self.saved != saved
+        self.saved = saved
+        if changed:
+            self._images.clear()
+        if refresh:
+            if self.saved_only.get() and changed:
+                self.refresh(preserve_view=True)
+            else:
+                self._mark_selection()
+        return True
+
+    def _notify_saved_changed(self):
+        for gallery in list(getattr(self.app, 'result_browsers', ())):
+            if gallery is not self and callable(getattr(gallery, 'reload_saved', None)):
+                gallery.reload_saved()
+
+    def _focused(self, event):
+        if not self._closed and event.widget is self.win:
+            self.reload_saved()
+
+    def toggle_saved(self, path):
+        if not path or self._closed:
             return
-        if path in self.saved:
-            del self.saved[path]
-        else:
-            row = next((row for row in self.rows if row['path'] == path), None)
-            if row:
-                self.saved[path] = dict(row)
+        saved_path = self._saved_path(path)
+        memory = getattr(self.app, 'file_memory', None)
+        try:
+            if saved_path:
+                if memory is not None:
+                    memory.unsave_photo(saved_path)
+                else:
+                    getattr(self.app, '_photo_saved_fallback', {}).pop(saved_path, None)
+                self.saved.pop(saved_path, None)
+            else:
+                row = next((row for row in self.rows if row['path'] == path), None)
+                if not row:
+                    return
+                if memory is not None:
+                    current = Path(path).stat()
+                    if ((row.get('mtime') is not None and abs(float(row['mtime']) - current.st_mtime) > .000001)
+                            or (row.get('size') is not None and int(row['size']) != current.st_size)):
+                        messagebox.showerror('사진이 바뀌었어요',
+                                             '검색한 뒤 원본이 바뀌었어요. 다시 찾아서 확인한 뒤 찜해 주세요.', parent=self.win)
+                        return
+                    if memory.save_photo(row) is not True:
+                        raise RuntimeError('Photo was not saved')
+                else:
+                    current = Path(path).stat()
+                    reference = dict(row, _saved_reference=True, available=True,
+                                     saved_mtime_ns=current.st_mtime_ns, saved_size=current.st_size,
+                                     saved_ino=current.st_ino, saved_dev=current.st_dev)
+                    if not hasattr(self.app, '_photo_saved_fallback'):
+                        self.app._photo_saved_fallback = OrderedDict()
+                    self.app._photo_saved_fallback[path] = reference
+                if not self.reload_saved(refresh=False):
+                    return
+        except Exception:
+            messagebox.showerror('찜 목록을 바꾸지 못했어요',
+                                 '사진의 위치나 저장 상태를 확인한 뒤 다시 눌러 주세요.', parent=self.win)
+            return
         if self.saved_only.get():
             self.refresh(preserve_view=True)
         else:
             self._mark_selection()
             self._update_tabs()
+        self._notify_saved_changed()
 
     def _update_tabs(self):
         saved = self.saved_only.get()
@@ -502,8 +633,8 @@ class PhotoGallery:
         self.saved_button.configure(text=f'♥ 찜한 사진 {len(self.saved)}' if self.saved else '♡ 찜한 사진 0',
                                     bg='#EDE8FA' if saved else 'white', fg=ACCENT if saved else INK)
         self.result_total.configure(text=f'{len(self.visible):,}장')
-        self.save_button.configure(text='♥ 찜했어요' if self.selected_path in self.saved else '♡ 찜하기')
-        self.win.title('짱구의 사진 상자 · ' + ('찜한 사진 (이 창을 닫기 전까지 보관)' if saved else self.search_query or '찾은 사진'))
+        self.save_button.configure(text='♥ 찜 해제' if self._saved_path(self.selected_path) else '♡ 찜하기')
+        self.win.title('짱구의 사진 상자 · ' + ('찜한 사진' if saved else self.search_query or '찾은 사진'))
 
     def quick_refine(self, text):
         self.refine_query.set(text)
@@ -575,15 +706,15 @@ class PhotoGallery:
             empty = tk.Frame(self.grid, bg=BG, padx=24, pady=30)
             empty.grid(row=0, column=0, sticky='nsew')
             title = '마음에 드는 사진을 모아보세요' if self.saved_only.get() and not self.saved else '이 조건의 사진은 아직 없어요'
-            message = ('사진의 ♡를 누르면 이곳에서 모아 볼 수 있어요.\n찜한 사진은 이 창을 닫기 전까지 보관해요.'
+            message = ('사진의 ♡를 누르면 이곳에서 모아 볼 수 있어요.\n창을 닫아도 찜한 사진은 저장돼요.'
                        if self.saved_only.get() and not self.saved else
                        '조건을 초기화하거나 기억나는 모습을 다르게 말해 보세요.\n분석 중인 사진은 결과에 추가될 수 있어요.')
             tk.Label(empty, text='♡' if self.saved_only.get() else '⌕', bg=BG, fg=ACCENT,
                      font=('맑은 고딕', 30)).pack(anchor='w')
             tk.Label(empty, text=title, bg=BG, fg=INK, font=('맑은 고딕', 14, 'bold')).pack(anchor='w', pady=8)
             tk.Label(empty, text=message, bg=BG, fg=MUTED, justify='left', wraplength=380).pack(anchor='w')
-            _button(empty, '찾은 사진으로 돌아가기' if self.saved_only.get() else '조건 초기화',
-                    lambda: self.show_saved(False) if self.saved_only.get() else self.reset()).pack(anchor='w', pady=16)
+            _button(empty, '닫기' if self.saved_context else '찾은 사진으로 돌아가기' if self.saved_only.get() else '조건 초기화',
+                    self.close if self.saved_context else lambda: self.show_saved(False) if self.saved_only.get() else self.reset()).pack(anchor='w', pady=16)
         total = len(self.visible)
         self.count.configure(text=f'{start + 1}–{min(start + PAGE_SIZE, total)} / {total}장' if total else '사진 0장')
         self.previous.configure(state='normal' if self.page else 'disabled')
@@ -688,25 +819,33 @@ class PhotoGallery:
                 return 'break'
 
     def _load(self, row, size, target):
-        sources = tuple(dict.fromkeys(str(value) for value in (row.get('thumbnail'), row['path']) if value))
+        saved = bool(row.get('_saved_reference'))
+        sources = (row['path'],) if saved else tuple(dict.fromkeys(str(value) for value in (row.get('thumbnail'), row['path']) if value))
         # Existence/stat calls also run in the worker: a disconnected share must
         # not freeze the Tk input loop before thumbnail work can be scheduled.
-        key = (sources, row.get('mtime', 0), size)
+        key = (sources, row.get('saved_mtime_ns', row.get('mtime', 0)), size)
+        if saved and row.get('available') is False:
+            self._queue.put((target, key, None, _saved_problem(row)))
+            return
         if row.get('status') == 'PC에 내려받지 않은 사진':
-            self._queue.put((target, key, None))
+            self._queue.put((target, key, None, ''))
             return
-        if key in self._images:
+        if not saved and key in self._images:
             self._images.move_to_end(key)
-            self._queue.put((target, key, self._images[key]))
+            self._queue.put((target, key, self._images[key], ''))
             return
-        future = self._pool.submit(_decode_sources, sources, size)
+        future = self._pool.submit(_decode_saved, dict(row), size) if saved else self._pool.submit(_decode_sources, sources, size)
         self._jobs.add(future)
+        output = self._queue
         def done(job):
+            problem = ''
             try:
                 picture = None if job.cancelled() else job.result()
+                if saved and picture is not None:
+                    picture, problem = picture
             except Exception:
                 picture = None
-            self._queue.put((target, key, picture))
+            output.put((target, key, picture, problem))
         future.add_done_callback(done)
 
     def _drain(self):
@@ -716,7 +855,7 @@ class PhotoGallery:
         self._jobs = {job for job in self._jobs if not job.done()}
         for _ in range(40):
             try:
-                target, key, picture = self._queue.get_nowait()
+                target, key, picture, problem = self._queue.get_nowait()
             except queue.Empty:
                 break
             if picture is not None:
@@ -727,12 +866,15 @@ class PhotoGallery:
             kind, generation, path = target
             if generation != self._generation:
                 continue
+            if problem:
+                self._mark_unavailable(path, problem)
             if kind == 'card':
                 card = next((item for item in self.cards if item.row['path'] == path), None)
                 if card is None or key[2] != self._card_image_size():
                     continue
                 if picture is None:
-                    card.image_label.configure(text='미리보기를 만들 수 없어요\n원본 열기로 확인해 주세요', height=8)
+                    card.image_label.configure(image='', text=(problem + '\n찜을 해제할 수 있어요') if problem else
+                                               '미리보기를 만들 수 없어요\n원본 열기로 확인해 주세요', height=8)
                 else:
                     picture = ImageOps.pad(picture, self._card_image_size(), color='#F1EEE8', method=Image.Resampling.LANCZOS)
                     photo = ImageTk.PhotoImage(picture, master=self.win)
@@ -740,7 +882,9 @@ class PhotoGallery:
                     card.image_label.configure(image=photo, text='', width=0, height=self._card_image_size()[1])
             elif path == self.selected_path and key[2] == self._preview_size:
                 if picture is None:
-                    self.preview_image.configure(image='', text='미리보기를 만들 수 없어요\n아래에서 원본을 열어 주세요', height=6)
+                    self.preview_photo = None
+                    self.preview_image.configure(image='', text=(problem + '\n찜을 해제할 수 있어요') if problem else
+                                                 '미리보기를 만들 수 없어요\n아래에서 원본을 열어 주세요', height=6)
                 else:
                     picture = picture.copy()
                     draw = ImageDraw.Draw(picture)
@@ -758,6 +902,44 @@ class PhotoGallery:
 
     def selected(self):
         return next((row for row in self.visible if row['path'] == self.selected_path), None)
+
+    def _mark_unavailable(self, path, problem):
+        self.photos.pop(path, None)
+        for row in list(self.saved.values()) + self.visible:
+            if _path_key(row['path']) == _path_key(path) and row.get('_saved_reference'):
+                row.update(available=False, unavailable_reason=problem)
+        for card in self.cards:
+            if card.row['path'] == path:
+                card.image_label.configure(image='', text=problem + '\n찜을 해제할 수 있어요', height=8)
+                card.reason_label.configure(text='원본 확인 필요', bg='#FAE8DA', fg='#864723')
+                card.delete_control.configure(state='disabled')
+        if self.selected_path == path:
+            self.preview_photo = None
+            self.preview_image.configure(image='', text=problem + '\n찜을 해제할 수 있어요', height=6)
+            self.reason.configure(text=problem + ' · 찜을 해제할 수 있어요.')
+            for button in self.actions:
+                button.configure(state='normal' if button is self.save_button else 'disabled')
+            self.delete_button.configure(state='disabled')
+            self.close_viewer()
+
+    def _action_row(self):
+        row = self.selected()
+        if row:
+            problem = _saved_problem(row)
+            if problem:
+                self._mark_unavailable(row['path'], problem)
+                return None
+        return row
+
+    @staticmethod
+    def _viewer_row(row):
+        if not row.get('_saved_reference'):
+            return row
+        # The viewer normally permits a cached thumbnail when an original is
+        # unavailable; a saved reference must never use that fallback.
+        result = dict(row)
+        result.pop('thumbnail', None)
+        return result
 
     def select(self, path, control=None, ensure=False):
         self.selected_path = path
@@ -782,7 +964,7 @@ class PhotoGallery:
             selected = card.row['path'] == self.selected_path
             card.configure(highlightbackground=ACCENT if selected else BORDER,
                            highlightcolor=ACCENT)
-            card.save_control.configure(text='♥' if card.row['path'] in self.saved else '♡')
+            card.save_control.configure(text='♥' if self._saved_path(card.row['path']) else '♡')
             card.delete_control.configure(state='normal' if self._can_delete(card.row) else 'disabled',
                                           text='처리 중' if card.row['path'] in self._deleting_paths else '삭제')
         row = self.selected()
@@ -795,8 +977,9 @@ class PhotoGallery:
 
     def _show_selected(self):
         row = self.selected()
+        unavailable = bool(row and row.get('_saved_reference') and row.get('available') is False)
         for button in self.actions:
-            button.configure(state='normal' if row else 'disabled')
+            button.configure(state='normal' if row and (not unavailable or button is self.save_button) else 'disabled')
         self.preview_photo = None
         self.preview_image.configure(image='', text='사진을 불러오는 중…' if row else '사진을 선택해 주세요', height=6)
         self.reason.configure(text=_reason(row) if row else '')
@@ -812,8 +995,8 @@ class PhotoGallery:
         self.location.configure(state='disabled')
         self._update_tabs()
         if self.viewer:
-            if row:
-                self.viewer.show(row, index, len(self.visible))
+            if row and not unavailable:
+                self.viewer.show(self._viewer_row(row), index, len(self.visible))
                 self.viewer.set_delete_pending(row['path'] in self._deleting_paths)
             else:
                 self.close_viewer()
@@ -852,7 +1035,7 @@ class PhotoGallery:
         return self.open_viewer()
 
     def open_viewer(self):
-        row = self.selected()
+        row = self._action_row()
         if not row:
             return 'break'
         if self.viewer is None:
@@ -860,7 +1043,7 @@ class PhotoGallery:
             self.viewer = PhotoViewer(self.win, self.move_selection, self.open, self.reveal, self._viewer_closed,
                                       on_delete=self.delete_photo)
         index = next((i for i, item in enumerate(self.visible) if item['path'] == row['path']), 0)
-        self.viewer.show(row, index, len(self.visible))
+        self.viewer.show(self._viewer_row(row), index, len(self.visible))
         self.viewer.set_delete_pending(row['path'] in self._deleting_paths)
         self.viewer.win.lift()
         self.viewer.win.focus_set()
@@ -881,7 +1064,7 @@ class PhotoGallery:
         return 'break'
 
     def open(self, preview=False):
-        row = self.selected()
+        row = self._action_row()
         if row:
             if preview:
                 self.app.preview(row)
@@ -890,18 +1073,22 @@ class PhotoGallery:
         return 'break'
 
     def reveal(self):
-        row = self.selected()
+        row = self._action_row()
         if row:
             self.app.reveal(row['path'])
 
     def _can_delete(self, row):
         return bool(row and callable(getattr(self.app, 'recycle_photo', None))
                     and row['path'] not in self._deleting_paths
+                    and row.get('available') is not False
                     and row.get('status') != 'PC에 내려받지 않은 사진')
 
     def delete_photo(self, path=None):
         path = path or self.selected_path
-        row = next((item for item in list(self.rows) + list(self.saved.values()) if item['path'] == path), None)
+        row = next((item for item in self.visible + list(self.saved.values()) + list(self.rows) if item['path'] == path), None)
+        if row and _saved_problem(row):
+            self._mark_unavailable(path, _saved_problem(row))
+            return 'break'
         if not self._can_delete(row):
             return 'break'
         # Capture the exact row before opening a modal: an analysis update can
@@ -916,10 +1103,11 @@ class PhotoGallery:
         self._mark_selection()
         def finished(result):
             self._deleting_paths.discard(path)
+            if result.get('ok'):
+                self.remove_photo(path)
             if self._closed:
                 return
             if result.get('ok'):
-                self.remove_photo(path)
                 self.count.configure(text=f'휴지통으로 보냈어요 · {len(self.visible):,}장')
             else:
                 self._mark_selection()
@@ -934,6 +1122,20 @@ class PhotoGallery:
         return 'break'
 
     def remove_photo(self, path):
+        # Stub apps may complete deletion without PhotoController. Persist
+        # success here as well, even if this gallery was closed meanwhile.
+        memory = getattr(self.app, 'file_memory', None)
+        removed_saved = True
+        try:
+            if memory is not None:
+                memory.unsave_photo(path)
+            else:
+                fallback = getattr(self.app, '_photo_saved_fallback', {})
+                for saved in list(fallback):
+                    if _path_key(saved) == _path_key(path):
+                        fallback.pop(saved, None)
+        except Exception:
+            removed_saved = False
         if self._closed:
             return
         if path in self._removed_paths and not any(row['path']==path for row in self.rows) and path not in self.saved:
@@ -944,7 +1146,11 @@ class PhotoGallery:
             self.selected_path = remaining[min(old_index, len(remaining) - 1)]['path'] if remaining else None
         self._removed_paths.add(path)
         self.rows = [row for row in self.rows if row['path'] != path]
-        self.saved.pop(path, None)
+        saved_path = self._saved_path(path)
+        if removed_saved:
+            self.saved.pop(saved_path, None)
+        elif saved_path:
+            self.saved[saved_path].update(available=False, unavailable_reason='원본을 휴지통으로 보냈어요. 찜 해제를 다시 눌러 주세요.')
         # Drop in-memory pixels too; late decoders are ignored by generation.
         self._images.clear()
         self.refresh(preserve_view=True)
@@ -966,7 +1172,7 @@ class PhotoGallery:
                                          state='disabled' if searching else 'normal')
 
     def find_similar(self):
-        row = self.selected()
+        row = self._action_row()
         if row:
             self.app.find_similar_photo(row)
 
@@ -991,6 +1197,14 @@ class PhotoGallery:
         self._pool.shutdown(wait=False, cancel_futures=True)
         self.app.result_browsers.discard(self)
         self._images.clear()
+        self.photos.clear()
+        self.preview_photo = None
+        self._brand_photo = None
+        # Destroyed galleries may be collected later in a thumbnail worker.
+        # Release Tcl variables/images now, while still on the UI thread.
+        for name in ('saved_only', 'card_size', 'refine_query', 'query', 'mode', 'sort', 'ime', 'refine_ime'):
+            if hasattr(self, name):
+                setattr(self, name, None)
 
     def close(self):
         self._dispose()
